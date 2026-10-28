@@ -233,6 +233,11 @@ pub(crate) fn global_settings() -> GlobalSettings {
     SNAPSHOT.with(|s| s.borrow().global_settings().clone())
 }
 
+mod write_tracker;
+pub(crate) use write_tracker::Stored;
+#[cfg(feature = "use-node")]
+use write_tracker::WriteTracker;
+
 #[cfg(feature = "use-node")]
 mod wire {
     use super::*;
@@ -246,15 +251,18 @@ mod wire {
     use std::sync::OnceLock;
 
     const CODE_HASH: &str =
-        include_str!("../../modules/mail-local-state/build/mail_local_state_code_hash");
-    const CODE: &[u8] =
-        include_bytes!("../../modules/mail-local-state/build/freenet/mail_local_state");
+        include_str!("../../published-contract/wasm/v1/mail_local_state_code_hash");
+    const CODE: &[u8] = include_bytes!("../../published-contract/wasm/v1/mail_local_state");
     const PARAMS: &[u8] =
-        include_bytes!("../../modules/mail-local-state/build/mail-local-state-params");
+        include_bytes!("../../published-contract/wasm/v1/mail-local-state-params");
 
-    /// Set after the delegate is registered + its initial `GetAll` is issued.
-    /// Used by the response handler in `api::node_comms` to recognise replies
-    /// destined for this delegate.
+    #[test]
+    fn embedded_local_state_wasm_has_the_embedded_code_hash() {
+        crate::api::embedded_artifact::assert_delegate(CODE, CODE_HASH);
+    }
+
+    /// Set before the delegate is registered. Used by the response handler in
+    /// `api::node_comms` to recognise replies destined for this delegate.
     pub(crate) static LOCAL_STATE_KEY: OnceLock<DelegateKey> = OnceLock::new();
 
     fn params() -> Result<Parameters<'static>, DynError> {
@@ -262,11 +270,92 @@ mod wire {
         Ok(Parameters::try_from(p)?)
     }
 
+    thread_local! {
+        /// Requests to the local-state delegate the node has not answered
+        /// yet. A write the UI applied optimistically is lost if the page
+        /// reloads before the node answers it (#286), so nothing may be
+        /// reported done before then. See [`super::write_tracker`].
+        static WRITES: RefCell<WriteTracker> = RefCell::new(WriteTracker::default());
+    }
+
+    /// The request's kind, for logs. Never the payload: it can hold drafts.
+    fn kind(msg: &LocalStateMsg) -> &'static str {
+        match msg {
+            LocalStateMsg::Init => "Init",
+            LocalStateMsg::SaveDraft { .. } => "SaveDraft",
+            LocalStateMsg::DeleteDraft { .. } => "DeleteDraft",
+            LocalStateMsg::MarkRead { .. } => "MarkRead",
+            LocalStateMsg::SaveSent { .. } => "SaveSent",
+            LocalStateMsg::DeleteSent { .. } => "DeleteSent",
+            LocalStateMsg::SetSentDeliveryState { .. } => "SetSentDeliveryState",
+            LocalStateMsg::ArchiveMessage { .. } => "ArchiveMessage",
+            LocalStateMsg::UnarchiveMessage { .. } => "UnarchiveMessage",
+            LocalStateMsg::DeleteMessage { .. } => "DeleteMessage",
+            LocalStateMsg::SetIdentitySettings { .. } => "SetIdentitySettings",
+            LocalStateMsg::SetGlobalSettings { .. } => "SetGlobalSettings",
+            LocalStateMsg::GetAll => "GetAll",
+        }
+    }
+
+    fn count_sent(kind: &str) {
+        let unanswered = WRITES.with(|w| w.borrow_mut().sent());
+        crate::log::info(format!("local-state {kind} sent ({unanswered} unanswered)"));
+    }
+
+    /// Send a local-state request and count it until the node answers.
+    async fn send_counted(
+        client: &mut WebApiRequestClient,
+        request: DelegateRequest<'static>,
+        msg: &LocalStateMsg,
+    ) -> Result<(), DynError> {
+        count_sent(kind(msg));
+        if let Err(e) = client.send(request.into()).await {
+            // It never reached the node, so nothing will answer it.
+            WRITES.with(|w| w.borrow_mut().unsent());
+            return Err(e.into());
+        }
+        Ok(())
+    }
+
+    /// The node answered a local-state request: with a `DelegateResponse`
+    /// (`ok`), or with an error naming this delegate.
+    pub(crate) fn note_answer(ok: bool) {
+        let unanswered = WRITES.with(|w| w.borrow_mut().answered(ok));
+        let how = if ok {
+            "answered"
+        } else {
+            "answered with an error"
+        };
+        crate::log::info(format!("local-state {how} ({unanswered} unanswered)"));
+    }
+
+    /// The node reported a delegate error that names no delegate.
+    pub(crate) fn note_unattributed_error() {
+        WRITES.with(|w| w.borrow_mut().unattributed_error());
+    }
+
+    /// Whether every local-state request sent so far was stored: waits for
+    /// the node's answers, or for `timeout`.
+    pub(crate) async fn writes_stored(timeout: impl std::future::Future<Output = ()>) -> Stored {
+        let wait = WRITES.with(|w| w.borrow_mut().wait());
+        super::write_tracker::stored_or_timeout(wait, timeout).await
+    }
+
     pub(crate) async fn register_and_init(
         client: &mut WebApiRequestClient,
     ) -> Result<DelegateKey, DynError> {
         let params = params()?;
-        let key = crate::api::create_delegate(client, CODE_HASH, CODE, &params).await?;
+        // Known before anything is sent, so the response handler recognises
+        // every answer, the first included.
+        let key = DelegateKey::from_params(CODE_HASH, &params)?;
+        let _ = LOCAL_STATE_KEY.set(key.clone());
+        // The node answers the registration too (an empty `DelegateResponse`
+        // for this key), so it is counted like every other request.
+        count_sent("RegisterDelegate");
+        if let Err(e) = crate::api::create_delegate(client, CODE_HASH, CODE, &params).await {
+            WRITES.with(|w| w.borrow_mut().unsent());
+            return Err(e);
+        }
         // Init is idempotent in the delegate.
         let request = DelegateRequest::ApplicationMessages {
             params: params.clone(),
@@ -275,7 +364,7 @@ mod wire {
             )],
             key: key.clone(),
         };
-        client.send(request.into()).await?;
+        send_counted(client, request, &LocalStateMsg::Init).await?;
         Ok(key)
     }
 
@@ -291,8 +380,7 @@ mod wire {
             )],
             key: key.clone(),
         };
-        client.send(request.into()).await?;
-        Ok(())
+        send_counted(client, request, &LocalStateMsg::GetAll).await
     }
 
     async fn send_msg(
@@ -311,8 +399,7 @@ mod wire {
             )],
             key,
         };
-        client.send(request.into()).await?;
-        Ok(())
+        send_counted(client, request, msg).await
     }
 
     pub(crate) async fn save_draft(
@@ -438,7 +525,8 @@ pub(crate) use wire::delete_sent;
 #[cfg(feature = "use-node")]
 pub(crate) use wire::{
     LOCAL_STATE_KEY, archive_message, delete_draft, delete_message, fetch_all, mark_read,
-    register_and_init, save_draft, save_sent, set_sent_delivery_state,
+    note_answer, note_unattributed_error, register_and_init, save_draft, save_sent,
+    set_sent_delivery_state, writes_stored,
 };
 // `unarchive_message` is wired but unused until later phases.
 #[cfg(feature = "use-node")]

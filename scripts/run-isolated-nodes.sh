@@ -35,10 +35,12 @@ PEER_DATA="$ROOT/peer/data"
 PEER_LOGS="$ROOT/peer/logs"
 PEER_CONFIG="$ROOT/peer/config"
 
-GW_PORT_NET=31338
-GW_PORT_WS=7510
-PEER_PORT_NET=31339
-PEER_PORT_WS=7511
+# Overridable so the harness can run beside another node using the defaults
+# (live-node.spec.ts and publish-email-iso read the same WS port variables).
+GW_PORT_NET="${FREENET_ISO_GW_NET_PORT:-31338}"
+GW_PORT_WS="${FREENET_ISO_GW_PORT:-7510}"
+PEER_PORT_NET="${FREENET_ISO_PEER_NET_PORT:-31339}"
+PEER_PORT_WS="${FREENET_ISO_PEER_PORT:-7511}"
 
 GW_PIDFILE="$ROOT/gw.pid"
 PEER_PIDFILE="$ROOT/peer.pid"
@@ -145,18 +147,37 @@ up() {
             --config-dir "$GW_CONFIG" \
             --data-dir "$GW_DATA" \
             --public-network-address 127.0.0.1 \
+            --public-network-port "$GW_PORT_NET" \
             --log-dir "$GW_LOGS" \
             --log-level info
         # Wait for gateway to bind ws port + write transport_keypair.
+        gw_ready=0
         for _ in $(seq 1 30); do
             if [ -f "$GW_DATA/secrets/transport_keypair" ] && \
                curl -sf -o /dev/null "http://127.0.0.1:$GW_PORT_WS/" 2>/dev/null; then
+                gw_ready=1
                 break
             fi
             sleep 0.5
         done
+        if [ "$gw_ready" != 1 ]; then
+            if [ -f "$GW_DATA/secrets/transport_keypair" ]; then
+                echo "error: the gateway wrote its keypair but is not answering on :$GW_PORT_WS after 15 s:" >&2
+            else
+                echo "error: the gateway wrote no $GW_DATA/secrets/transport_keypair within 15 s; it most likely exited at startup:" >&2
+            fi
+            tail -20 "$GW_LOGS/stdout.log" >&2 || true
+            exit 1
+        fi
     fi
 
+    if [ ! -f "$GW_DATA/secrets/transport_keypair" ]; then
+        # Only reachable when :$GW_PORT_WS was already taken above.
+        echo "error: something is already listening on :$GW_PORT_WS, but $GW_DATA has no transport keypair," >&2
+        echo "       so it is not this harness's gateway. Stop it, or choose other ports" >&2
+        echo "       (FREENET_ISO_GW_PORT and friends)." >&2
+        exit 1
+    fi
     GW_PUBKEY=$(derive_pubkey)
     echo "$GW_PUBKEY" > "$GW_PUBKEY_FILE"
     echo "gateway pubkey: $GW_PUBKEY"

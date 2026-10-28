@@ -138,6 +138,9 @@ pub(crate) struct WebApiRequestClient {
 #[derive(Clone, Debug)]
 pub(crate) struct WebApiRequestClient;
 
+// The error type is freenet-stdlib's own; boxing it here would only move
+// the size into every caller's `map_err`.
+#[allow(clippy::result_large_err)]
 impl WebApiRequestClient {
     #[cfg(feature = "use-node")]
     pub async fn send(
@@ -330,6 +333,41 @@ mod contract_api {
     }
 }
 
+/// Checks for the embedded artifacts: the WASM a module uploads and the
+/// code hash it derives keys from must be the same artifact. Each module
+/// that embeds one calls these on its own consts.
+#[cfg(all(test, feature = "use-node"))]
+pub(crate) mod embedded_artifact {
+    use freenet_stdlib::prelude::*;
+
+    /// A container built from `code` (as `contract_api::create_contract`
+    /// builds it) has the key `code_hash` derives (as every lookup does).
+    pub(crate) fn assert_contract(code: &[u8], code_hash: &str) {
+        let params = Parameters::from(vec![1u8, 2, 3]);
+        let container = ContractContainer::try_from((code.to_vec(), &params))
+            .expect("embedded contract WASM loads");
+        let key = ContractKey::from_params(code_hash, params).expect("embedded code hash decodes");
+        assert_eq!(
+            container.key(),
+            key,
+            "the embedded contract WASM does not have the embedded code hash"
+        );
+    }
+
+    /// The same for a delegate (as `delegate_api::create_delegate` builds it).
+    pub(crate) fn assert_delegate(code: &[u8], code_hash: &str) {
+        let params = Parameters::from(vec![1u8, 2, 3]);
+        let container = DelegateContainer::try_from((code.to_vec(), &params))
+            .expect("embedded delegate WASM loads");
+        let key = DelegateKey::from_params(code_hash, &params).expect("embedded code hash decodes");
+        assert_eq!(
+            *container.key(),
+            key,
+            "the embedded delegate WASM does not have the embedded code hash"
+        );
+    }
+}
+
 #[cfg(feature = "use-node")]
 pub(crate) use delegate_api::create_delegate;
 
@@ -508,7 +546,12 @@ mod inbox_management {
     use super::*;
 
     const INBOX_CODE: &[u8] =
-        include_bytes!("../../contracts/inbox/build/freenet/freenet_email_inbox");
+        include_bytes!("../../published-contract/wasm/v1/freenet_email_inbox");
+
+    #[test]
+    fn embedded_inbox_wasm_has_the_embedded_code_hash() {
+        crate::api::embedded_artifact::assert_contract(INBOX_CODE, crate::inbox::INBOX_CODE_HASH);
+    }
 
     thread_local! {
         pub(super) static CREATED_INBOX: RefCell<Vec<(Rc<str>, ContractKey)>> = const { RefCell::new(Vec::new()) };
@@ -781,9 +824,16 @@ mod token_record_management {
 
     use super::*;
 
-    const TOKEN_RECORD_CODE: &[u8] = include_bytes!(
-        "../../modules/antiflood-tokens/contracts/token-allocation-record/build/freenet/freenet_token_allocation_record"
-    );
+    const TOKEN_RECORD_CODE: &[u8] =
+        include_bytes!("../../published-contract/wasm/v1/freenet_token_allocation_record");
+
+    #[test]
+    fn embedded_token_record_wasm_has_the_embedded_code_hash() {
+        crate::api::embedded_artifact::assert_contract(
+            TOKEN_RECORD_CODE,
+            crate::aft::TOKEN_RECORD_CODE_HASH,
+        );
+    }
 
     thread_local! {
         pub(super) static CREATED_AFT_RECORD: RefCell<Vec<(Rc<str>, ContractKey)>> = const { RefCell::new(Vec::new()) };
@@ -919,12 +969,19 @@ mod token_generator_management {
 
     use super::*;
 
-    const TOKEN_GEN_CODE_HASH: &str = include_str!(
-        "../../modules/antiflood-tokens/delegates/token-generator/build/token_generator_code_hash"
-    );
-    const TOKEN_GEN_CODE: &[u8] = include_bytes!(
-        "../../modules/antiflood-tokens/delegates/token-generator/build/freenet/freenet_token_generator"
-    );
+    const TOKEN_GEN_CODE_HASH: &str =
+        include_str!("../../published-contract/wasm/v1/token_generator_code_hash");
+    const TOKEN_GEN_CODE: &[u8] =
+        include_bytes!("../../published-contract/wasm/v1/freenet_token_generator");
+
+    #[test]
+    fn embedded_token_generator_wasm_has_the_embedded_code_hash() {
+        crate::api::embedded_artifact::assert_delegate(TOKEN_GEN_CODE, TOKEN_GEN_CODE_HASH);
+        assert_eq!(
+            TOKEN_GEN_CODE_HASH,
+            crate::aft::TOKEN_GENERATOR_DELEGATE_CODE_HASH
+        );
+    }
 
     thread_local! {
         pub(super) static CREATED_AFT_GEN: RefCell<Vec<(Rc<str>, DelegateKey)>> = const { RefCell::new(Vec::new()) };
@@ -976,11 +1033,16 @@ mod identity_management {
     use super::*;
 
     const ID_MANAGER_CODE_HASH: &str =
-        include_str!("../../modules/identity-management/build/identity_management_code_hash");
+        include_str!("../../published-contract/wasm/v1/identity_management_code_hash");
     const ID_MANAGER_CODE: &[u8] =
-        include_bytes!("../../modules/identity-management/build/freenet/identity_management");
+        include_bytes!("../../published-contract/wasm/v1/identity_management");
     const ID_MANAGER_KEY: &[u8] =
-        include_bytes!("../../modules/identity-management/build/identity-manager-params");
+        include_bytes!("../../published-contract/wasm/v1/identity-manager-params");
+
+    #[test]
+    fn embedded_identity_wasm_has_the_embedded_code_hash() {
+        crate::api::embedded_artifact::assert_delegate(ID_MANAGER_CODE, ID_MANAGER_CODE_HASH);
+    }
 
     pub(super) async fn create_delegate(
         client: &mut WebApiRequestClient,
@@ -2214,6 +2276,25 @@ pub(crate) async fn node_comms(
                                 }
                             }
                             RequestError::DelegateError(error) => {
+                                // An error is the node's answer to a request. One
+                                // naming the local-state delegate answers one of its
+                                // requests; one naming no delegate might have.
+                                let named = match &error {
+                                    DelegateError::RegisterError(key)
+                                    | DelegateError::Missing(key) => Some(key),
+                                    DelegateError::MissingSecret { key, .. } => Some(key),
+                                    _ => None,
+                                };
+                                match named {
+                                    Some(key)
+                                        if crate::local_state::LOCAL_STATE_KEY.get()
+                                            == Some(key) =>
+                                    {
+                                        crate::local_state::note_answer(false)
+                                    }
+                                    Some(_) => {}
+                                    None => crate::local_state::note_unattributed_error(),
+                                }
                                 crate::log::error(
                                     format!("received delegate request error: {error}"),
                                     None,
@@ -2988,6 +3069,11 @@ pub(crate) async fn node_comms(
                 let is_local_state_empty = crate::local_state::LOCAL_STATE_KEY
                     .get()
                     .is_some_and(|k| k == &key);
+                if is_local_state_empty {
+                    // Every local-state request gets exactly this answer once
+                    // the delegate has run it: a write is stored from here.
+                    crate::local_state::note_answer(true);
+                }
                 if values.is_empty() && &key == IDENTITIES_KEY.get().unwrap() {
                     // no-op: see comment above
                 } else if values.is_empty() && is_local_state_empty {

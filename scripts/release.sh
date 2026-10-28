@@ -11,15 +11,17 @@
 #     $WEB_CONTAINER_KEY_FILE (default ~/.config/freenet-email/web-container-keys.toml)
 #   • A Freenet network-connected node is running and reachable
 #     (not a `freenet local` sandbox)
-#   • `gh` is authenticated to push a branch and open a PR
 #   • GNU tar is installed (for reproducible archives)
+#   • The frozen artifacts in published-contract/ match their pins
 #
 # Usage:
 #     scripts/release.sh 0.1.0
 #     scripts/release.sh 0.1.0 --yes   # auto-confirm every prompt
 #
-# After the snapshot PR it opens is squash-merged, finish with
-# `scripts/release-tag.sh <version>`.
+# The contract WASM is frozen, so a release changes nothing in the repo:
+# it publishes a newly signed webapp state under the fixed webapp contract
+# id, updates the container contract's pointer, and tags the commit it
+# built from.
 #
 # The script is idempotent up to the publish: re-running after a failed
 # build or publish re-runs it and prompts again. Once the publish has
@@ -100,22 +102,12 @@ remote_ref_absent() {
 remote_ref_absent "refs/tags/$TAG" \
     || die "tag $TAG already exists on origin. Either bump the version or delete it remotely."
 
-# The snapshot goes up as release/$TAG after the publish. Check now, so a
-# leftover branch can't fail the run after the irreversible steps.
-RELEASE_BRANCH="release/$TAG"
-if git rev-parse -q --verify "refs/heads/$RELEASE_BRANCH" >/dev/null; then
-    die "branch $RELEASE_BRANCH already exists locally (git branch -D $RELEASE_BRANCH if it is stale)"
-fi
-remote_ref_absent "refs/heads/$RELEASE_BRANCH" \
-    || die "branch $RELEASE_BRANCH already exists on origin (delete it if it is stale)"
-
 # Publish exactly what is on origin/main.
 git fetch -q origin +refs/heads/main:refs/remotes/origin/main
 if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
     die "local main ($(git rev-parse --short HEAD)) is not origin/main ($(git rev-parse --short origin/main)). Pull first."
 fi
-# Recorded in the snapshot commit; release-tag.sh refuses to tag if the
-# snapshot was merged onto any other base (it would carry unpublished code).
+# The commit the release is built from, published from, and tagged.
 SOURCE_SHA=$(git rev-parse HEAD)
 
 # Workspace Cargo.toml version must match the requested release version.
@@ -158,16 +150,13 @@ echo "  ✓ production key at $KEY_FILE"
 command -v fdev >/dev/null || die "fdev not in PATH (cargo install fdev)"
 command -v dx >/dev/null || die "dx (dioxus-cli) not in PATH"
 command -v cargo-make >/dev/null || die "cargo-make not in PATH"
-command -v gh >/dev/null || die "gh (GitHub CLI) not in PATH"
-# `gh pr create` runs after the irreversible publish; fail here instead.
-gh auth status >/dev/null 2>&1 || die "gh is not authenticated (gh auth login)"
 
-# fdev must support the --as-state flag for facade pointer flips.
+# fdev must support the --as-state flag for container pointer flips.
 # Older builds silently wrap the file as `UpdateData::Delta` and the
-# facade contract then returns `InvalidUpdate`, so the pointer never
-# moves and users hitting the stable facade URL get a stale app.
+# container contract then returns `InvalidUpdate`, so the pointer never
+# moves and users hitting the stable container URL get a stale app.
 if ! fdev execute update --help 2>&1 | grep -q -- '--as-state'; then
-    die "fdev does not support \`--as-state\` (required for facade UPDATE).
+    die "fdev does not support \`--as-state\` (required for container UPDATE).
 Build a newer fdev from freenet-core HEAD:
   cargo install --path /path/to/freenet-core/crates/fdev"
 fi
@@ -200,6 +189,11 @@ fi
 echo "  ✓ clean tree on main"
 echo "  ✓ tag $TAG available"
 
+# The frozen artifacts the release publishes and the UI embeds.
+bash "$REPO_ROOT/scripts/check-frozen-artifacts.sh" >/dev/null \
+    || die "published-contract/ does not match its pins (see scripts/check-frozen-artifacts.sh)"
+echo "  ✓ frozen artifacts match their pins"
+
 # Tests
 echo ""
 echo "═══ Running tests ══════════════════════════════════════════════════"
@@ -224,19 +218,20 @@ fi
 
 # ─── Confirmation ──────────────────────────────────────────────────────────
 
+CONTRACT_ID=$(tr -d '[:space:]' < published-contract/contract-id.txt)
+
 echo ""
 echo "═══ About to release $TAG ════════════════════════════════════════════"
 echo ""
 echo "This will:"
-echo "  1. Build the UI and contracts in release mode"
+echo "  1. Build the UI in release mode (contract WASM is frozen, not rebuilt)"
 echo "  2. Sign the webapp with the PRODUCTION key at $KEY_FILE"
-echo "  3. Publish the contract to the real Freenet network via fdev"
-echo "  4. Flip the stable facade pointer to the new webapp"
-echo "  5. Commit the new published-contract/ snapshot on $RELEASE_BRANCH"
-echo "  6. Push that branch and open the snapshot PR"
+echo "  3. Publish the webapp to the real Freenet network via fdev, under the"
+echo "     webapp contract id $CONTRACT_ID"
+echo "  4. Update the container contract's pointer to that webapp"
+echo "  5. Tag $SOURCE_SHA as $TAG and push the tag"
 echo ""
-echo "Steps 3-6 are PUBLICLY VISIBLE; 3 and 4 cannot be undone."
-echo "Tag afterwards with scripts/release-tag.sh $VERSION once the PR merges."
+echo "Steps 3-5 are PUBLICLY VISIBLE; 3 and 4 cannot be undone."
 confirm "Proceed?"
 
 # ─── Build + publish ───────────────────────────────────────────────────────
@@ -245,106 +240,77 @@ echo ""
 echo "═══ Building and publishing ═══════════════════════════════════════"
 
 # Armed BEFORE the publish: fdev can time out after the server-side publish
-# succeeded (freenet-core#4102). From here a re-run may publish again, so
-# say how to finish by hand instead.
+# succeeded (freenet-core#4102).
 RELEASE_FINISHED=0
-SNAPSHOT_CHANGED=""
+PUBLISHED=0
 on_post_publish_exit() {
     [ "$RELEASE_FINISHED" = "1" ] && return
     echo "" >&2
-    if [ -z "$SNAPSHOT_CHANGED" ]; then
-        # Stopped inside `cargo make publish-production`: work out whether the
-        # publish itself happened before telling the user what to do.
-        local new_id old_id
-        new_id=$(tr -d '[:space:]' < published-contract/contract-id.txt 2>/dev/null || true)
-        old_id=$(git show "$SOURCE_SHA:published-contract/contract-id.txt" 2>/dev/null | tr -d '[:space:]' || true)
-        if [ -z "$new_id" ] || [ "$new_id" = "$old_id" ]; then
-            # Either the build failed before writing a new id, or the build
-            # reproduced the live contract exactly; publishing an identical
-            # contract again changes nothing, so a re-run is safe either way.
-            echo "✗ release.sh stopped before anything new was published for $TAG" >&2
-            echo "  (build or signing step, or the build reproduced the live contract id)." >&2
-            echo "  Fix the error, run 'git checkout -- published-contract/' if it shows" >&2
-            echo "  changes, and re-run scripts/release.sh $VERSION." >&2
-            return
-        fi
-        if ! curl -sf -m 60 -o /dev/null "http://127.0.0.1:${FREENET_PORT}/v1/contract/web/${new_id}/"; then
-            echo "✗ release.sh stopped while publishing $TAG, and the gateway does not serve" >&2
-            echo "  the new webapp ($new_id). It most likely did not land: run" >&2
-            echo "  'git checkout -- published-contract/' and re-run scripts/release.sh $VERSION." >&2
-            return
-        fi
-        echo "✗ release.sh stopped, but the new webapp ($new_id) IS live (fdev timeout?)." >&2
-    else
-        echo "✗ release.sh stopped after publishing $TAG." >&2
+    if [ "$PUBLISHED" = "0" ]; then
+        # Stopped inside `cargo make publish-production`. The webapp
+        # contract is frozen, so its id is the same whether or not the new
+        # state landed. A re-run signs with a newer timestamp version, which
+        # supersedes whatever a timed-out publish left behind.
+        echo "✗ release.sh stopped in the build, sign or publish step for $TAG." >&2
+        echo "  The new webapp may or may not have landed (fdev can time out after a" >&2
+        echo "  publish that succeeded). A re-run signs a newer version, which supersedes" >&2
+        echo "  it: fix the error and re-run scripts/release.sh $VERSION." >&2
+        return
     fi
-    echo "  Do NOT re-run release.sh; it would publish again." >&2
-    echo "  Current branch: $(git rev-parse --abbrev-ref HEAD)" >&2
+    echo "✗ release.sh stopped after publishing $TAG." >&2
     echo "  To finish by hand (RELEASING.md 'Recovery'):" >&2
-    echo "    1. Check the facade points at the new webapp; if not, see 'Manual pointer flip'." >&2
-    if [ "$SNAPSHOT_CHANGED" = "0" ]; then
-        echo "    2. Nothing to commit: scripts/release-tag.sh $VERSION --sha $SOURCE_SHA" >&2
-    else
-        echo "    2. Commit published-contract/ on $RELEASE_BRANCH (git checkout -b if needed)," >&2
-        echo "       git push -u origin $RELEASE_BRANCH, and open a PR against main. The commit" >&2
-        echo "       message must contain these two lines (release-tag.sh checks them):" >&2
-        echo "         Contract ID: $(tr -d '[:space:]' < published-contract/contract-id.txt 2>/dev/null || echo '<id from published-contract/contract-id.txt>')" >&2
-        echo "         Published-From: $SOURCE_SHA" >&2
-        echo "    3. After the squash merge: scripts/release-tag.sh $VERSION" >&2
-    fi
+    echo "    1. Check the container contract points at the webapp; if not, see 'Manual pointer flip'." >&2
+    echo "    2. scripts/release-tag.sh $VERSION --sha $SOURCE_SHA" >&2
+    echo "  Re-running release.sh instead is also safe: it signs a newer version." >&2
 }
 # EXIT, not ERR: `die` and a declined `confirm` leave via `exit`.
 trap on_post_publish_exit EXIT
 
 cargo make publish-production
+PUBLISHED=1
 
-# ─── Verify the commit-worthy diff ─────────────────────────────────────────
-
-SNAPSHOT_CHANGED=1
-if [ -z "$(git status --porcelain -- published-contract/)" ]; then
-    SNAPSHOT_CHANGED=0
-    echo "  ⚠️  published-contract/ unchanged — wasm bytes + parameters identical to last release."
-    echo "      Lockfile-isolated build (#198) kept wasm reproducible. Signature has a"
-    echo "      fresh timestamp and was re-published, but the snapshot files are bit-equal."
-    echo "      Will tag $TAG against current HEAD without an empty release commit."
+# Nothing in the repo may change during a release: published-contract/
+# holds the frozen artifacts, and a change there means something wrote to
+# them. Stop rather than commit it.
+if [ -n "$(git status --porcelain -- published-contract/)" ]; then
+    git status --short -- published-contract/ >&2
+    die "published-contract/ changed during the release. Those files are frozen:
+restore them with 'git checkout -- published-contract/' and find what wrote to them."
 fi
-
-CONTRACT_ID=$(cat published-contract/contract-id.txt)
-echo ""
-echo "  ✓ published contract id: $CONTRACT_ID"
+echo "  ✓ published-contract/ unchanged"
+echo "  ✓ published webapp contract id: $CONTRACT_ID"
 echo ""
 
-# ─── Facade pointer flip (issue #200 Phase 3) ──────────────────────────────
+# ─── Container pointer flip (issue #200 Phase 3) ──────────────────────────────
 #
-# The web-container contract id rotates per release (#198 root cause).
-# Users hit the facade contract instead — a stable bookmarkable URL whose
-# state points at the current release's webapp. Per release we re-render
-# the facade loader with the new current_app_id baked in, sign a new
-# facade state with bumped version, and UPDATE the facade contract.
+# Users bookmark the container contract, a stable URL whose state points at
+# the webapp. The webapp contract is frozen, so the pointer normally names the
+# same app id every release; it is still re-signed with a bumped version and
+# UPDATEd each release.
 #
-# Conditional: only runs when published-contract/facade-id.txt exists
-# (i.e. the facade has been published once and its id committed). Until
+# Conditional: only runs when published-contract/container-id.txt exists
+# (i.e. the container contract has been published once and its id committed). Until
 # then, this step warns + skips so the rest of the release still goes
 # through. See #200 Phase 1 (PR #205) and #206 (Linux-built snapshot).
 
-if [ -f published-contract/facade-id.txt ]; then
-    FACADE_ID=$(cat published-contract/facade-id.txt | tr -d '[:space:]')
-    echo "═══ Flipping facade pointer (issue #200) ════════════════════════════"
-    echo "  facade contract id: $FACADE_ID"
+if [ -f published-contract/container-id.txt ]; then
+    FACADE_ID=$(cat published-contract/container-id.txt | tr -d '[:space:]')
+    echo "═══ Flipping container pointer (issue #200) ════════════════════════════"
+    echo "  container contract id: $FACADE_ID"
     echo "  pointing at:        $CONTRACT_ID"
 
-    # Re-render the loader with the new current_app_id and sign the
-    # facade state with the production key (same key that signs the
-    # web-container — facade reuses it).
-    FACADE_CURRENT_APP_ID="$CONTRACT_ID" cargo make build-facade-loader
-    cargo make sign-facade-state
+    # Re-render the loader with the current_app_id and sign the container
+    # state with the production key (the same key signs the webapp
+    # contract's state).
+    FACADE_CURRENT_APP_ID="$CONTRACT_ID" cargo make build-container-loader
+    cargo make sign-container-state
 
-    FACADE_STATE="$REPO_ROOT/target/facade/facade.state"
+    FACADE_STATE="$REPO_ROOT/target/container/container.state"
     if [ ! -f "$FACADE_STATE" ]; then
-        die "facade state not produced at $FACADE_STATE — sign step failed?"
+        die "container state not produced at $FACADE_STATE — sign step failed?"
     fi
 
-    confirm "Push facade UPDATE to the network now?"
+    confirm "Push container UPDATE to the network now?"
 
     # fdev execute update takes positional args KEY DELTA [RELEASE].
     # The RELEASE positional is currently a no-op in fdev (and errors
@@ -352,92 +318,40 @@ if [ -f published-contract/facade-id.txt ]; then
     # the local fdev API points at; since release prerequisites assert
     # a `freenet network` daemon, the update propagates network-wide.
     #
-    # --as-state: facade `update_state` only matches `UpdateData::State`.
+    # --as-state: the container's `update_state` only matches `UpdateData::State`.
     # Without this flag fdev wraps the file as `UpdateData::Delta` and
     # the contract returns `InvalidUpdate`. Requires fdev with the
     # `--as-state` flag (freenet-core PR; older fdev silently fails).
     fdev execute update --as-state "$FACADE_ID" "$FACADE_STATE"
 
-    echo "  ✓ facade UPDATEd; bookmarked URL stays stable across releases"
+    echo "  ✓ container contract UPDATEd; bookmarked URL stays stable across releases"
     echo ""
 else
-    echo "  ⚠️  published-contract/facade-id.txt not committed yet."
-    echo "      Skipping facade pointer flip (issue #200 Phase 1 prerequisite)."
-    echo "      Once the facade is published once and the id committed, this"
+    echo "  ⚠️  published-contract/container-id.txt not committed yet."
+    echo "      Skipping container pointer flip (issue #200 Phase 1 prerequisite)."
+    echo "      Once the container contract is published once and the id committed, this"
     echo "      step will run automatically per release."
     echo ""
 fi
 
-if [ "$SNAPSHOT_CHANGED" = "1" ]; then
-    echo "Diff in published-contract/:"
-    git status --short -- published-contract/
-    echo ""
-    confirm "Commit this snapshot on release/$TAG and open a PR?"
-
-    # ─── Commit on a release branch ────────────────────────────────────────────
-    #
-    # main is protected by a ruleset (required checks, squash-only merges), so
-    # the snapshot cannot be pushed to main directly. It goes up as
-    # release/$TAG with a PR, and local main is left untouched. The tag is
-    # created after the squash merge by scripts/release-tag.sh, because
-    # squashing gives the commit a new SHA.
-
-    git checkout -b "$RELEASE_BRANCH"
-    git add published-contract/
-    git commit -m "chore(release): $TAG — production publish
-
-Contract ID: $CONTRACT_ID
-Published-From: $SOURCE_SHA
-
-Signed with the uncommitted production key at
-~/.config/freenet-email/web-container-keys.toml.
-"
-
-    echo ""
-    echo "═══ Pushing release branch ═════════════════════════════════════════"
-    confirm "Push $RELEASE_BRANCH and open the snapshot PR?"
-
-    git push -u origin "$RELEASE_BRANCH"
-    PR_URL=$(gh pr create --base main --head "$RELEASE_BRANCH" \
-        --title "chore(release): $TAG — production publish" \
-        --body "Release snapshot from \`scripts/release.sh $VERSION\`, already published to the network.
-
-- webapp contract id: \`$CONTRACT_ID\`
-- built and published from main at \`$SOURCE_SHA\`
-
-Squash-merge once CI is green, **before merging anything else**: if main moves first, the merged commit would include code that was never published, and \`scripts/release-tag.sh\` will refuse to tag it. Then run \`scripts/release-tag.sh $VERSION\` on main.
-
-Contract ID: $CONTRACT_ID
-Published-From: $SOURCE_SHA")
-    git checkout main
-    RELEASE_FINISHED=1
-
-    echo ""
-    echo "✅ published $TAG; snapshot PR: $PR_URL"
-    echo ""
-    echo "Finish the release once that PR is merged:"
-    echo "  scripts/release-tag.sh $VERSION"
-else
-    confirm "Tag current HEAD as $TAG (no snapshot commit)?"
-    "$REPO_ROOT/scripts/release-tag.sh" "$VERSION" --sha "$SOURCE_SHA" --yes
-    RELEASE_FINISHED=1
-    echo ""
-    echo "✅ released $TAG"
-fi
+confirm "Tag $SOURCE_SHA as $TAG?"
+"$REPO_ROOT/scripts/release-tag.sh" "$VERSION" --sha "$SOURCE_SHA" --yes
+RELEASE_FINISHED=1
+echo ""
+echo "✅ released $TAG"
 
 echo ""
 echo "Next steps:"
-echo "  1. Wait ~30s for the contract (and facade UPDATE, if applicable)"
-echo "     to propagate"
-echo "  2. Smoke-test against the rotating webapp id:"
+echo "  1. Wait ~30s for the webapp and container updates to propagate"
+echo "  2. Smoke-test against the webapp id:"
 echo "       scripts/smoke-test-production.sh \\"
 echo "         http://<gw>:<port>/contract/web/$CONTRACT_ID/"
-if [ -f published-contract/facade-id.txt ]; then
-    FACADE_ID_FOR_NOTES=$(cat published-contract/facade-id.txt | tr -d '[:space:]')
-    echo "  3. Smoke-test against the STABLE facade URL (issue #200):"
+if [ -f published-contract/container-id.txt ]; then
+    FACADE_ID_FOR_NOTES=$(cat published-contract/container-id.txt | tr -d '[:space:]')
+    echo "  3. Smoke-test against the STABLE container URL (issue #200):"
     echo "       scripts/smoke-test-production.sh \\"
     echo "         http://<gw>:<port>/contract/web/$FACADE_ID_FOR_NOTES/"
-    echo "     The facade URL is what users bookmark and what stays stable"
+    echo "     The container URL is what users bookmark and what stays stable"
     echo "     across releases."
     echo "  4. Post the smoke-test result as a comment on issue #9"
 else

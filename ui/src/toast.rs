@@ -117,13 +117,24 @@ pub(crate) type ToastQueue = Signal<Vec<Toast>>;
 /// Returns the [`ToastId`] assigned to the new toast; callers that want to
 /// dismiss it early can pass the id to [`dismiss_toast`].
 pub(crate) fn push_toast(message: impl Into<String>, level: ToastLevel) -> ToastId {
+    push_toast_to(use_context::<ToastQueue>(), message, level)
+}
+
+/// [`push_toast`] onto a queue captured earlier. For code that runs outside
+/// the component tree, such as a detached task, where `use_context` cannot
+/// find the queue: capture it with `use_context::<ToastQueue>()` while still
+/// in a component scope, and push here later.
+pub(crate) fn push_toast_to(
+    mut queue: ToastQueue,
+    message: impl Into<String>,
+    level: ToastLevel,
+) -> ToastId {
     let id = ToastId::next();
     let toast = Toast {
         id,
         message: message.into(),
         level,
     };
-    let mut queue = use_context::<ToastQueue>();
     queue.write().push(toast);
 
     // Spawn a TTL timer. It captures the id and only removes *this* toast,
@@ -147,10 +158,32 @@ pub(crate) fn push_toast(message: impl Into<String>, level: ToastLevel) -> Toast
     id
 }
 
+/// Push a toast with no auto-dismiss, for a state that lasts until the
+/// caller ends it (e.g. "Deleting…" until the node has stored the delete).
+/// The caller removes it with [`dismiss_toast_in`]; the user can dismiss it
+/// at any time.
+pub(crate) fn push_sticky_toast_to(
+    mut queue: ToastQueue,
+    message: impl Into<String>,
+    level: ToastLevel,
+) -> ToastId {
+    let id = ToastId::next();
+    queue.write().push(Toast {
+        id,
+        message: message.into(),
+        level,
+    });
+    id
+}
+
 /// Remove a toast by id. Silently no-ops if the id is no longer in the queue
 /// (already dismissed or expired).
 pub(crate) fn dismiss_toast(id: ToastId) {
-    let mut queue = use_context::<ToastQueue>();
+    dismiss_toast_in(use_context::<ToastQueue>(), id);
+}
+
+/// [`dismiss_toast`] on a queue captured earlier (see [`push_toast_to`]).
+pub(crate) fn dismiss_toast_in(mut queue: ToastQueue, id: ToastId) {
     queue.write().retain(|t| t.id != id);
 }
 

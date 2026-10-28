@@ -22,6 +22,13 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
+      - 'modules/**'
+      - 'contracts/inbox/**'
+      - 'scripts/**'
+      - 'Makefile.toml'
+      - 'legacy_*.toml'
+      - '.githooks/**'
+      - '.github/workflows/check-contract-wasm.yml'
 
 jobs:
   changes:
@@ -39,7 +46,7 @@ jobs:
         id: filter
         run: |
           # An allowlist of what is safe to skip, not a list of what
-          # matters: many inputs move facade.wasm bytes (.cargo/config.toml
+          # matters: many inputs move container.wasm bytes (.cargo/config.toml
           # rustflags, Makefile.toml, scripts/), and a missed one must run
           # the gate, not skip it. No Markdown file feeds the build, except
           # under ui/public/ (Dioxus asset_dir, shipped in the webapp).
@@ -63,9 +70,8 @@ jobs:
     # `!cancelled()` rather than `always()`: still runs when `changes`
     # failed, but not on a run that was cancelled outright.
     if: ${{ !cancelled() && needs.changes.outputs.relevant != 'false' }}
-    # ubicloud-standard-8 — rebuilding the published contract from
-    # source involves a full wasm32 compile of the web-container +
-    # webapp, same compile-bound profile as build.yml.
+    # ubicloud-standard-8: the container contract byte-equality step
+    # below is a full wasm32 release compile.
     runs-on: ubicloud-standard-8
     steps:
       - uses: actions/checkout@v7
@@ -74,53 +80,43 @@ jobs:
           fetch-depth: 2
 
       - name: Install Rust
-        # Pinned (issue #206): facade.wasm bytes are sensitive to rustc
-        # version. Stable-channel bumps would silently rotate the facade
-        # contract id. Keep in sync with rust-toolchain.toml.
-        uses: dtolnay/rust-toolchain@1.95.0
+        # Keep in sync with rust-toolchain.toml.
+        uses: dtolnay/rust-toolchain@1.99.1
         with:
           targets: wasm32-unknown-unknown
+
+      - name: Install the container contract's pinned Rust
+        # Issue #206: container.wasm bytes, and so the container contract
+        # id, depend on the rustc version. contracts/facade/rust-toolchain.toml
+        # pins it; rustup reads that file here and in every container build.
+        working-directory: contracts/facade
+        run: rustup toolchain install
 
       - name: Cache cargo-installed binaries
         id: cache-bins
         uses: actions/cache@v6
         with:
           path: |
-            ~/.cargo/bin/cargo-make
-            ~/.cargo/bin/cargo-binstall
             ~/.cargo/bin/fdev
-            ~/.cargo/bin/dx
-          key: ${{ runner.os }}-cargo-bins-fdev-0.3.201-dx-0.7.3-v3
+          key: ${{ runner.os }}-cargo-bins-fdev-0.3.313-v4
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Install cargo-binstall
-        if: steps.cache-bins.outputs.cache-hit != 'true'
-        uses: taiki-e/install-action@cargo-binstall
-
-      - name: Install cargo-make
-        if: steps.cache-bins.outputs.cache-hit != 'true'
-        run: cargo binstall -y --force cargo-make
-
-      - name: Install Dioxus CLI
-        if: steps.cache-bins.outputs.cache-hit != 'true'
-        run: cargo binstall -y --force --version 0.7.3 dioxus-cli
-
       - name: Install fdev
         if: steps.cache-bins.outputs.cache-hit != 'true'
-        run: cargo install --force fdev
+        # The prebuilt fdev from the matching freenet-core release
+        # (v0.2.151 ships fdev 0.3.313).
+        run: |
+          mkdir -p "$HOME/.cargo/bin"
+          curl -fsSL "https://github.com/freenet/freenet-core/releases/download/v0.2.151/fdev-x86_64-unknown-linux-musl.tar.gz" \
+            | tar -xz -C "$HOME/.cargo/bin/" fdev
+          chmod +x "$HOME/.cargo/bin/fdev"
+          fdev --version
 
-      # Issue #214 F1 tripwire — must run BEFORE the rebuild step below,
-      # which overwrites published-contract/webapp.parameters with a
-      # file signed by the committed test key. The committed-on-main
-      # parameters MUST be the production verifying key.
-      #
-      # The web-container contract id rotates per release (intentional,
-      # see #198), but the signing key must still be the production key
-      # — never the committed test key from
-      # test-contract/web-container-keys.toml. See issue #241 for the
-      # ordering bug this fixes.
+      # Issue #214 F1 tripwire. The committed parameters MUST be the
+      # production verifying key, never the committed test key from
+      # test-contract/web-container-keys.toml (#241).
       - name: Verify webapp.parameters matches production pubkey
         run: |
           EXPECTED="31dd371fedc842994c6e571a0868e5eece1367a7d8cc16c498a57c985526ae46"
@@ -130,68 +126,73 @@ jobs:
               echo "  expected: $EXPECTED"
               echo "  actual:   $ACTUAL"
               echo ""
-              echo "If this commit was meant to refresh the TEST snapshot"
-              echo "(\`cargo make update-published-contract\`), do not push"
-              echo "the test snapshot to main — only the production snapshot"
-              echo "(\`update-published-contract-prod\`) is committed."
+              echo "Only the production snapshot is committed. Restore it with"
+              echo "git checkout -- published-contract/."
               exit 1
           fi
           echo "✅ webapp.parameters matches the committed production pubkey."
 
-      - name: Rebuild published contract from source
-        run: cargo make update-published-contract
+      # The webapp contract, and the contract and delegate WASM the UI
+      # embeds, are frozen: their bytes are the keys users' data and URLs
+      # live under. Checks the byte pins, each WASM's code hash, and the
+      # derived webapp and container contract ids. This replaces the old
+      # informational rebuild-and-diff, which could never match: a rebuild
+      # embeds the build machine's paths.
+      - name: Verify frozen artifacts
+        run: bash scripts/check-frozen-artifacts.sh
 
-      - name: Compare rebuilt snapshot against committed
+      # The check above only proves the tree is self-consistent: rewriting a
+      # WASM, its code hash and its pin together passes it. This one proves
+      # nothing frozen changed. The base is HEAD^1 on a pull_request run (the
+      # checkout is the merge commit, fetch-depth: 2 above), and on a push
+      # the commit main pointed at before it (github.event.before), which may
+      # be several commits back; a push that creates the branch has no
+      # "before", so it falls back to HEAD^1.
+      - name: Verify no frozen artifact changed
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
         run: |
-          # NOTE: this step is informational-only until Phase 5 (#9)
-          # rebuilds the `published-contract/` snapshot from CI. The
-          # committed snapshot was produced on macOS; Ubuntu-produced
-          # WASM will differ byte-for-byte from it until the snapshot
-          # is rebuilt on Linux and committed. We print the diff as a
-          # warning and exit 0 so the job reports green.
-          if ! git diff --exit-code -- published-contract/; then
-            echo "::warning::published-contract/ drifted from source."
-            echo ""
-            echo "This is expected until Phase 5 (#9) rebuilds the"
-            echo "committed snapshot on Linux CI. The diagnostic below"
-            echo "will become actionable once that lands:"
-            echo ""
-            git diff -- published-contract/ || true
-            echo ""
-            echo "To refresh manually:"
-            echo "  cargo make update-published-contract"
-            echo "  git add published-contract/"
-            echo ""
-            exit 0
+          base=HEAD^1
+          if [ "$EVENT" = push ] && [ -n "$BEFORE" ] \
+            && [ "$BEFORE" != 0000000000000000000000000000000000000000 ]; then
+            git fetch --no-tags --depth=1 origin "$BEFORE"
+            base="$BEFORE"
           fi
-          echo "✅ published-contract/ is in sync with source."
+          bash scripts/check-frozen-immutable.sh "$base"
 
-      # Issue #206 (closes the Phase 1 informational gate). The facade
+      # Nothing else compiles the contract and delegate sources for wasm32
+      # now that the shipped bytes are frozen. Build each the way a new
+      # generation would be built, so the sources, scripts/build-wasm.sh and
+      # scripts/check-wasm-paths.sh keep working. The output is discarded.
+      - name: Build contract and delegate WASM reproducibly
+        run: bash scripts/check-wasm-builds.sh
+
+      # Issue #206 (closes the Phase 1 informational gate). The container
       # contract id is intended to stay byte-stable across releases.
       # Both prerequisites are now in place:
-      #   • rustc pinned in rust-toolchain.toml (and the dtolnay action
-      #     in this workflow uses the same pinned version).
-      #   • Snapshot at published-contract/facade.{wasm,parameters,id.txt}
+      #   • rustc pinned in contracts/facade/rust-toolchain.toml.
+      #   • Snapshot at published-contract/container{.wasm,.parameters,-id.txt}
       #     produced under linux/amd64 with that pinned rustc.
       # Any drift in the rebuilt wasm is now a release blocker —
       # the rebuild MUST match the committed snapshot byte-for-byte.
-      - name: Verify facade wasm byte-equality (issue #206)
+      - name: Verify container wasm byte-equality (issue #206)
         id: facade-verify
         run: |
-          if [ ! -f published-contract/facade.wasm ]; then
-            echo "::error::published-contract/facade.wasm missing."
-            echo "Bootstrap the snapshot via scripts/build-facade-snapshot-linux.sh"
-            echo "and commit published-contract/facade.{wasm,parameters,id.txt}."
+          if [ ! -f published-contract/container.wasm ]; then
+            echo "::error::published-contract/container.wasm missing."
+            echo "Bootstrap the snapshot via scripts/build-container-snapshot-linux.sh"
+            echo "and commit published-contract/container{.wasm,.parameters,-id.txt}."
             exit 1
           fi
-          bash scripts/check-facade-byte-equal.sh
+          bash scripts/check-container-byte-equal.sh
 
       # Bootstrap helper (#206): on drift, upload the freshly-built
-      # facade.wasm so an operator can download it, recompute the
+      # container.wasm so an operator can download it, recompute the
       # contract id, and commit the canonical CI-built snapshot. Local
       # docker amd64 emulation (qemu) produces different bytes from
       # native ubicloud amd64 — only CI bytes are canonical.
-      - name: Upload rebuilt facade.wasm on drift
+      - name: Upload rebuilt container.wasm on drift
         if: failure() && steps.facade-verify.conclusion == 'failure'
         uses: actions/upload-artifact@v7
         with:
@@ -200,24 +201,24 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      # Issue #214 F1: facade.parameters IS the production verifying
-      # key (32 bytes ed25519). The committed facade contract id is
-      # `hash(facade.wasm, facade.parameters)`, so swapping the
+      # Issue #214 F1: container.parameters IS the production verifying
+      # key (32 bytes ed25519). The committed container contract id is
+      # `hash(container.wasm, container.parameters)`, so swapping the
       # parameters silently rotates the stable bookmarkable URL —
       # exactly the failure #200 was designed to prevent. Hard-code
       # the production pubkey here as a tripwire: a PR that touches
-      # published-contract/facade.parameters MUST update this hex,
+      # published-contract/container.parameters MUST update this hex,
       # which is a visible, reviewable change.
       #
       # Production pubkey is the ed25519 verifying key under
       # ~/.config/freenet-email/web-container-keys.toml. Rotating the
       # production key requires bumping this constant in the same PR.
-      - name: Verify facade.parameters matches production pubkey
+      - name: Verify container.parameters matches production pubkey
         run: |
           EXPECTED="31dd371fedc842994c6e571a0868e5eece1367a7d8cc16c498a57c985526ae46"
-          ACTUAL=$(xxd -p -c 64 published-contract/facade.parameters | tr -d '\n')
+          ACTUAL=$(xxd -p -c 64 published-contract/container.parameters | tr -d '\n')
           if [ "$ACTUAL" != "$EXPECTED" ]; then
-              echo "::error::facade.parameters does not match the production verifying key."
+              echo "::error::container.parameters does not match the production verifying key."
               echo "  expected: $EXPECTED"
               echo "  actual:   $ACTUAL"
               echo ""
@@ -227,5 +228,5 @@ jobs:
               echo "      .github/workflows/check-contract-wasm.yml in the same PR."
               exit 1
           fi
-          echo "✅ facade.parameters matches the committed production pubkey."
+          echo "✅ container.parameters matches the committed production pubkey."
 
