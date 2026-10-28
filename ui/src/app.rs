@@ -25,6 +25,8 @@ use crate::{
 };
 
 pub(crate) mod address_book;
+pub(crate) mod backup_panel;
+pub(crate) mod backup_token;
 pub(crate) mod login;
 pub(crate) mod settings;
 
@@ -46,6 +48,12 @@ pub(crate) enum NodeAction {
         ml_dsa_key: Arc<MlDsaSigningKey<MlDsa65>>,
         ml_kem_dk: Box<DecapsulationKey<MlKem768>>,
         description: String,
+        /// Whether a backup of THESE keys is known to exist (the user
+        /// confirmed "I've saved it" while creating, or restored from a
+        /// recovery key / backup file). Recorded only after the create
+        /// request has been sent to the node without error; see
+        /// `login::record_backup_after_create`.
+        backed_up: bool,
     },
     CreateContract {
         alias: Rc<str>,
@@ -224,6 +232,35 @@ pub(crate) fn app() -> Element {
                             // "unknown sender" (#134).
                             let prev = *ab_gen.0.read();
                             ab_gen.0.set(prev.wrapping_add(1));
+                        }
+                        // Offline mode: register the identity in memory the
+                        // way the example-data seeding does, so the create
+                        // and restore flows end in a usable identity (and
+                        // are testable in Playwright) without a node.
+                        #[cfg(feature = "example-data")]
+                        NodeAction::CreateIdentity {
+                            alias,
+                            ml_dsa_key,
+                            ml_kem_dk,
+                            description,
+                            backed_up,
+                        } => {
+                            if Identity::get_alias(&alias).is_none() {
+                                // UserId must equal the slot index
+                                // (`User::set_logged_id` indexes by it).
+                                let id = UserId(user_sig.read().identities.len());
+                                let identity = Identity::new(
+                                    alias.clone(),
+                                    id,
+                                    description,
+                                    ml_dsa_key,
+                                    *ml_kem_dk,
+                                );
+                                Identity::register_example(identity.clone());
+                                user_sig.write().identities.push(identity);
+                                login::record_backup_after_create(&alias, backed_up);
+                                login_ctl.write().updated = true;
+                            }
                         }
                         NodeAction::RenameIdentity { old, new, .. } => {
                             // Offline mode: just relabel the in-memory

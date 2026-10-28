@@ -1,3 +1,5 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { test, expect, Page } from "@playwright/test";
 import { APP_NAME } from "./app-name";
 
@@ -1182,41 +1184,974 @@ test.describe("Import contact verify-check (#52)", () => {
   });
 });
 
+// Recovery key for the committed v2 JSON fixture's seeds. Pinned by the
+// `fixed_test_vector` unit test in ui/src/app/backup_token.rs; both encode
+// the same keys, so restoring either must show the same fingerprint.
+const FIXTURE_TOKEN =
+  "fmail-key-1:Ax4ijNhMohvn7t2FBdYENew4FSw2LERAQm36723fcqM8q2fzYT4re5MvYhBJjLckN1iBpybsSW4VW6UKgwBEkRspZvMH5LEzKcGe2Ag9k86C7eHeaB7UE3cVEroRp8wMbwxywGL95";
+const FIXTURE_JSON_PATH = path.join(
+  __dirname,
+  "..",
+  "src",
+  "app",
+  "testdata",
+  "identity-backup-v2.json",
+);
+
+async function openRestoreForm(page: Page) {
+  await page.goto("/");
+  await waitForApp(page);
+  await page.locator('[data-testid="fm-id-restore"]').click();
+  await expect(page.getByText("Restore identity")).toBeVisible({
+    timeout: 5_000,
+  });
+}
+
+async function recoveredWords(page: Page): Promise<string[]> {
+  const cells = page.locator(".verify-words", { hasText: "Recovered fingerprint" })
+    .locator(".verify-word .w");
+  await expect(cells).toHaveCount(6);
+  return (await cells.allTextContents()).map((w) => w.trim());
+}
+
+// The two fingerprint words an identity row shows ("Fingerprint w1 w2").
+async function rowFingerprint(page: Page, alias: string): Promise<string> {
+  const row = page.locator(`[data-testid="fm-id-row"][data-alias="${alias}"]`);
+  return (await row.locator(".id-fp").innerText()).replace(/Fingerprint/i, "").trim();
+}
+
+// Settings → Account for the currently open identity.
+async function openAccountSettings(page: Page) {
+  await page.locator('[data-testid="fm-settings-btn"]').click();
+  await page.locator('[data-testid="fm-settings-shell"]').waitFor({ timeout: 5_000 });
+  await page
+    .locator('[data-testid="fm-settings-nav-item"][data-screen="account"]')
+    .click();
+}
+
+const NOT_BACKED_UP = "This identity has not been backed up.";
+
+// Make both local clipboard paths fail, as they do in some sandboxed
+// browsers: execCommand returns false and the Clipboard API rejects.
+async function breakLocalClipboard(page: Page) {
+  await page.addInitScript(() => {
+    document.execCommand = () => false;
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: () => Promise.reject(new Error("blocked")) },
+    });
+  });
+}
+
+// Clipboard writes that take `ms` to settle: execCommand fails and the
+// Clipboard API resolves late, so a copy stays in flight for a while.
+async function slowClipboard(page: Page, ms: number) {
+  await page.addInitScript((delay) => {
+    document.execCommand = () => false;
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: () => new Promise<void>((resolve) => setTimeout(resolve, delay)),
+      },
+    });
+  }, ms);
+}
+
+// Clipboard API whose writes the TEST settles: execCommand fails so every
+// copy goes down the async path, and each writeText promise waits on
+// window.__copies[i] until `settleCopy(page, i, ok)` resolves or rejects
+// it. No timers, so the sequence is driven by the test, not by elapsed time.
+async function manualClipboard(page: Page) {
+  await page.addInitScript(() => {
+    document.execCommand = () => false;
+    const w = window as unknown as {
+      __copies: Array<{ resolve: () => void; reject: (e: Error) => void }>;
+    };
+    w.__copies = [];
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: () =>
+          new Promise<void>((resolve, reject) => w.__copies.push({ resolve, reject })),
+      },
+    });
+  });
+}
+
+async function copiesStarted(page: Page): Promise<number> {
+  return page.evaluate(
+    () => (window as unknown as { __copies: unknown[] }).__copies.length,
+  );
+}
+
+async function settleCopy(page: Page, index: number, ok: boolean) {
+  await page.evaluate(
+    ([i, success]) => {
+      const c = (
+        window as unknown as {
+          __copies: Array<{ resolve: () => void; reject: (e: Error) => void }>;
+        }
+      ).__copies[i as number];
+      if (success) c.resolve();
+      else c.reject(new Error("blocked"));
+    },
+    [index, ok] as const,
+  );
+}
+
+async function startCreateWithPanel(page: Page, alias: string) {
+  await page.goto("/");
+  await waitForApp(page);
+  await page.locator('[data-testid="fm-id-create"]').click();
+  await page.locator('[data-testid="fm-create-alias-input"]').fill(alias);
+  await page.locator('[data-testid="fm-create-submit"]').click();
+  await page.locator('[data-testid="fm-create-backup-now"]').click();
+  return page.locator('[data-testid="fm-backup-panel"]');
+}
+
 test.describe("Restore backup card (#52)", () => {
-  test("opens a file-picker form with disabled Restore until a backup is parsed", async ({
+  test("offers paste + upload, with Restore disabled until input parses", async ({
     page,
   }) => {
-    await page.goto("/");
-    await waitForApp(page);
+    await openRestoreForm(page);
 
-    await page.locator('[data-testid="fm-id-restore"]').click();
-
-    // Heading + amber nudge.
-    await expect(page.getByText("Restore identity")).toBeVisible({
-      timeout: 5_000,
-    });
     await expect(
-      page.getByText(/Backup files contain raw private keys\./),
+      page.getByText(/Recovery keys and backup files are private keys\./),
     ).toBeVisible();
-
-    // File input + alias/description placeholders.
-    await expect(
-      page.locator('[data-testid="fm-restore-file"]'),
-    ).toBeVisible();
-    await expect(
-      page.locator('input[placeholder="pre-filled from backup file"]').first(),
-    ).toBeVisible();
-
-    // Restore stays disabled until a parsed backup is in hand.
-    await expect(
-      page.locator('[data-testid="fm-restore-submit"]'),
-    ).toBeDisabled();
+    const paste = page.locator('[data-testid="fm-restore-paste"]');
+    await expect(paste).toBeVisible();
+    // The key must not be learned, corrected or capitalised by the browser.
+    await expect(paste).toHaveAttribute("autocomplete", "off");
+    await expect(paste).toHaveAttribute("spellcheck", "false");
+    await expect(paste).toHaveAttribute("autocapitalize", "off");
+    await expect(paste).toHaveAttribute("autocorrect", "off");
+    await expect(page.locator('[data-testid="fm-restore-file"]')).toBeVisible();
+    await expect(page.locator('[data-testid="fm-restore-file"]')).toHaveAttribute(
+      "accept",
+      ".json,.txt",
+    );
+    await expect(page.locator('[data-testid="fm-restore-submit"]')).toBeDisabled();
 
     // Cancel returns to hub.
     await page.getByRole("button", { name: "Cancel" }).click();
     await expect(
       page.locator('[data-testid="fm-id-row"][data-alias="address1"]'),
     ).toBeVisible();
+  });
+
+  test("pasting a recovery key enables Restore; a bad paste shows an error", async ({
+    page,
+  }) => {
+    await openRestoreForm(page);
+    const paste = page.locator('[data-testid="fm-restore-paste"]');
+    const submit = page.locator('[data-testid="fm-restore-submit"]');
+    const error = page.locator('[data-testid="fm-restore-error"]');
+
+    // Wrong kind of text.
+    await paste.fill("hello, this is not a key");
+    await expect(error).toContainText("isn't a Freenet Mail recovery key");
+    await expect(submit).toBeDisabled();
+
+    // Truncated by one character.
+    await paste.fill(FIXTURE_TOKEN.slice(0, -1));
+    await expect(error).toContainText("too short");
+    await expect(submit).toBeDisabled();
+
+    // One character changed.
+    const i = FIXTURE_TOKEN.length - 20;
+    const swapped =
+      FIXTURE_TOKEN.slice(0, i) +
+      (FIXTURE_TOKEN[i] === "x" ? "y" : "x") +
+      FIXTURE_TOKEN.slice(i + 1);
+    await paste.fill(swapped);
+    await expect(error).toContainText("at least one character is wrong");
+    await expect(submit).toBeDisabled();
+
+    // Valid key with an auto-capitalised prefix, wrapped the way a password
+    // manager might (CRLF + spaces).
+    const capitalised = "F" + FIXTURE_TOKEN.slice(1);
+    await paste.fill(`  ${capitalised.slice(0, 50)}\r\n${capitalised.slice(50)}  \n`);
+    await expect(error).toHaveCount(0);
+    await expect(submit).toBeEnabled();
+    expect(await recoveredWords(page)).toHaveLength(6);
+    // Recovery keys carry no name: the form asks for one.
+    await expect(page.getByText("Recovery keys don't include a name.")).toBeVisible();
+    await submit.click();
+    await expect(page.getByText("Choose an alias for this identity.")).toBeVisible();
+  });
+
+  test("typing a key by hand doesn't flag it as wrong before it could be complete", async ({
+    page,
+  }) => {
+    await openRestoreForm(page);
+    const paste = page.locator('[data-testid="fm-restore-paste"]');
+    const error = page.locator('[data-testid="fm-restore-error"]');
+
+    // Type the first part one key at a time: still incomplete, no error.
+    await paste.pressSequentially(FIXTURE_TOKEN.slice(0, 20));
+    await expect(error).toHaveCount(0);
+    // Leaving the box shows what's wrong with it as it stands.
+    await page.locator('[data-testid="fm-restore-alias"]').focus();
+    await expect(error).toContainText("too short");
+
+    // A character that can never be valid is flagged straight away.
+    await paste.focus();
+    await paste.press("End");
+    await paste.press("0");
+    await expect(error).toContainText("can't appear in one");
+  });
+
+  test("select-all + paste of a same-length bad key is checked at once, not treated as typing", async ({
+    page,
+    context,
+    browserName,
+  }) => {
+    test.skip(browserName !== "chromium", "uses the Chromium clipboard permission");
+    await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+    await openRestoreForm(page);
+    const paste = page.locator('[data-testid="fm-restore-paste"]');
+    const error = page.locator('[data-testid="fm-restore-error"]');
+    await paste.fill(FIXTURE_TOKEN);
+    await expect(error).toHaveCount(0);
+
+    // Same length, truncated payload + junk: too short once decoded, which
+    // would be held back if this counted as typing.
+    const bad = FIXTURE_TOKEN.slice(0, -1) + " ";
+    await page.evaluate((t) => navigator.clipboard.writeText(t), bad);
+    await paste.focus();
+    await page.keyboard.press("ControlOrMeta+A");
+    await page.keyboard.press("ControlOrMeta+V");
+    await expect(paste).toHaveValue(bad);
+    await expect(error).toContainText("too short");
+  });
+
+  test("restores from an uploaded v2 JSON file, matching the recovery key", async ({
+    page,
+  }) => {
+    await openRestoreForm(page);
+
+    // Fingerprint from the pasted recovery key...
+    await page.locator('[data-testid="fm-restore-paste"]').fill(FIXTURE_TOKEN);
+    const fromToken = await recoveredWords(page);
+
+    // ...must equal the fingerprint from the legacy JSON file of the same keys.
+    const file = page.locator('[data-testid="fm-restore-file"]');
+    await file.setInputFiles(FIXTURE_JSON_PATH);
+    await expect(page.getByText("Loaded from identity-backup-v2.json.")).toBeVisible();
+    const alias = page.locator('[data-testid="fm-restore-alias"]');
+    await expect(alias).toHaveValue("fixture-alice");
+    expect(await recoveredWords(page)).toEqual(fromToken);
+    // The picker is cleared, so choosing the same file again re-reads it.
+    await expect(file).toHaveValue("");
+
+    // Switching to a pasted key (which carries no name) drops the file's
+    // alias rather than restoring the key under a stale name.
+    await page.locator('[data-testid="fm-restore-paste"]').fill(FIXTURE_TOKEN);
+    await expect(alias).toHaveValue("");
+    await file.setInputFiles(FIXTURE_JSON_PATH);
+    await expect(alias).toHaveValue("fixture-alice");
+
+    // Provenance is per field: after editing only the description, a
+    // pasted key still drops the file's alias but keeps the typed text.
+    const desc = page.getByPlaceholder("e.g. work");
+    await expect(desc).toHaveValue("committed v2 test fixture");
+    await desc.fill("my own words");
+    await page.locator('[data-testid="fm-restore-paste"]').fill(FIXTURE_TOKEN);
+    await expect(alias).toHaveValue("");
+    await expect(desc).toHaveValue("my own words");
+    await file.setInputFiles(FIXTURE_JSON_PATH);
+    await expect(alias).toHaveValue("fixture-alice");
+
+    const submit = page.locator('[data-testid="fm-restore-submit"]');
+    await expect(submit).toBeEnabled();
+    await submit.click();
+    // The restored identity appears with the fingerprint the form showed.
+    await expect(page.getByText("Restore identity")).toHaveCount(0);
+    await expect(
+      page.locator('[data-testid="fm-id-row"][data-alias="fixture-alice"]'),
+    ).toBeVisible();
+    expect(await rowFingerprint(page, "fixture-alice")).toBe(fromToken.slice(0, 2).join(" "));
+  });
+
+  test("an old v1 JSON backup is rejected with a visible error", async ({
+    page,
+  }) => {
+    await openRestoreForm(page);
+    await page.locator('[data-testid="fm-restore-file"]').setInputFiles({
+      name: "old-backup.json",
+      mimeType: "application/json",
+      buffer: Buffer.from(
+        JSON.stringify({
+          version: 1,
+          alias: "old",
+          description: "",
+          keys: { rsa_key_bytes: [1, 2, 3] },
+        }),
+      ),
+    });
+    await expect(page.locator('[data-testid="fm-restore-error"]')).toContainText(
+      "early pre-release",
+    );
+    await expect(page.locator('[data-testid="fm-restore-submit"]')).toBeDisabled();
+  });
+});
+
+test.describe("Recovery key backup panel", () => {
+  test.beforeEach(async ({ context, browserName }) => {
+    // Lets the test read the clipboard back. Chromium-only API; the
+    // configured projects are all Chromium.
+    if (browserName === "chromium") {
+      await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+    }
+  });
+
+  test("identity row: masked key, copy, reveal, confirm, and the stamp lands", async ({
+    page,
+    browserName,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    const row = page.locator('[data-testid="fm-id-row"][data-alias="address1"]');
+    const rowFp = await rowFingerprint(page, "address1");
+
+    await row.locator('[data-testid="fm-id-backup"]').click();
+    const modal = page.locator('[data-testid="fm-backup-modal"]');
+    await expect(modal).toBeVisible();
+
+    // Masked by default: the secret is not in the DOM until revealed.
+    await expect(modal.locator('[data-testid="fm-backup-key-masked"]')).toBeVisible();
+    await expect(modal.locator('[data-testid="fm-backup-key"]')).toHaveCount(0);
+    const maskedText = await modal.innerText();
+    const maskedTree = await modal.ariaSnapshot();
+    await expect(modal.locator('[data-testid="fm-backup-entry-title"]')).toHaveText(
+      `Freenet Mail: address1 (${rowFp})`,
+    );
+
+    // Copy without revealing; "Copied" only on confirmed success.
+    await modal.locator('[data-testid="fm-backup-copy"]').click();
+    await expect(modal.locator('[data-testid="fm-backup-status"]')).toContainText(
+      "Copied.",
+    );
+    await expect(modal.locator('[data-testid="fm-backup-copy"]')).toHaveText("Copied");
+
+    // One fixed-label toggle; state is aria-pressed, and aria-controls
+    // points at exactly one element (ids are per panel).
+    const toggle = modal.locator('[data-testid="fm-backup-reveal"]');
+    await expect(toggle).toHaveText("Show key");
+    await expect(toggle).toHaveAttribute("aria-pressed", "false");
+    const controls = await toggle.getAttribute("aria-controls");
+    expect(controls).toMatch(/^fm-backup-key-value-\d+$/);
+    await expect(page.locator(`#${controls}`)).toHaveCount(1);
+    await toggle.click();
+    await expect(toggle).toHaveText("Show key");
+    await expect(toggle).toHaveAttribute("aria-pressed", "true");
+    const keyBox = modal.locator('[data-testid="fm-backup-key"]');
+    // The revealed key is announced as a labelled, read-only text box.
+    await expect(modal.getByRole("textbox", { name: "Recovery key" })).toBeVisible();
+    const token = (await keyBox.innerText()).trim();
+    expect(token).toMatch(/^fmail-key-1:[1-9A-HJ-NP-Za-km-z]+$/);
+    expect(token.length).toBeLessThan(170);
+    const payload = token.slice("fmail-key-1:".length);
+
+    // Neither the visible text nor the accessibility tree held the payload
+    // while masked, and hiding removes it again.
+    expect(maskedText).not.toContain(payload);
+    expect(maskedTree).not.toContain(payload);
+    await toggle.click();
+    await expect(keyBox).toHaveCount(0);
+    expect(await modal.innerText()).not.toContain(payload);
+    expect(await modal.ariaSnapshot()).not.toContain(payload);
+
+    if (browserName === "chromium") {
+      const clip = await page.evaluate(() => navigator.clipboard.readText());
+      expect(clip).toBe(token);
+    }
+
+    // Confirm, close, and check the stamp actually landed in Settings.
+    await modal.locator('[data-testid="fm-backup-saved"]').click();
+    await expect(modal.locator('[data-testid="fm-backup-saved-note"]')).toBeVisible();
+    await modal.getByRole("button", { name: "Close" }).click();
+    await expect(modal).toHaveCount(0);
+    await selectIdentity(page, "address1");
+    await openAccountSettings(page);
+    await expect(page.getByText(NOT_BACKED_UP)).toHaveCount(0);
+    await expect(page.locator(".fm-row-set", { hasText: "Last backup" })).not.toContainText(
+      "Never",
+    );
+  });
+
+  test("restoring a key that is already on this device says so instead of duplicating it", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    const row = page.locator('[data-testid="fm-id-row"][data-alias="address1"]');
+    await row.locator('[data-testid="fm-id-backup"]').click();
+    const modal = page.locator('[data-testid="fm-backup-modal"]');
+    await modal.locator('[data-testid="fm-backup-reveal"]').click();
+    const token = (await modal.locator('[data-testid="fm-backup-key"]').innerText()).trim();
+    await modal.getByRole("button", { name: "Close" }).click();
+
+    await page.locator('[data-testid="fm-id-restore"]').click();
+    await page.locator('[data-testid="fm-restore-paste"]').fill(token);
+    await expect(page.locator('[data-testid="fm-restore-existing"]')).toContainText(
+      "already on this device, as “address1”",
+    );
+    await page.locator('[data-testid="fm-restore-alias"]').fill("address1-copy");
+    await expect(page.locator('[data-testid="fm-restore-submit"]')).toBeDisabled();
+  });
+
+  test("a press inside the dialog that ends on the backdrop doesn't close it", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await page
+      .locator('[data-testid="fm-id-row"][data-alias="address1"] [data-testid="fm-id-backup"]')
+      .click();
+    const modal = page.locator('[data-testid="fm-backup-modal"]');
+    await expect(modal).toBeVisible();
+    const box = (await modal.boundingBox())!;
+    // A point on the veil beside the dialog (clear of the body margin).
+    const veil = { x: Math.max(14, box.x / 2), y: box.y + box.height / 2 };
+    // Drag-select from inside the dialog out onto the veil.
+    await page.mouse.move(box.x + box.width / 2, box.y + 60);
+    await page.mouse.down();
+    await page.mouse.move(veil.x, veil.y, { steps: 5 });
+    await page.mouse.up();
+    await expect(modal).toBeVisible();
+    // A real backdrop click still closes it.
+    await page.mouse.click(veil.x, veil.y);
+    await expect(modal).toHaveCount(0);
+  });
+
+  test("when copying fails, the panel says so and doesn't count it as exported", async ({
+    page,
+  }) => {
+    await breakLocalClipboard(page);
+    await page.goto("/");
+    await waitForApp(page);
+    await page.locator('[data-testid="fm-id-create"]').click();
+    await page.locator('[data-testid="fm-create-alias-input"]').fill("nocopy");
+    await page.locator('[data-testid="fm-create-submit"]').click();
+    await page.locator('[data-testid="fm-create-backup-now"]').click();
+    const panel = page.locator('[data-testid="fm-backup-panel"]');
+
+    await panel.locator('[data-testid="fm-backup-copy"]').click();
+    await expect(panel.locator('[data-testid="fm-backup-status"]')).toContainText(
+      "Couldn't copy",
+    );
+    await expect(panel.locator('[data-testid="fm-backup-copy"]')).toHaveText(
+      "Copy recovery key",
+    );
+    // A failed copy didn't arm the "key already left the browser" warning:
+    // Discard goes straight back to the hub.
+    await page.getByRole("button", { name: "Discard", exact: true }).click();
+    await expect(page.getByText("Discard backed-up identity?")).toHaveCount(0);
+    await expect(page.locator('[data-testid="fm-id-create"]')).toBeVisible();
+  });
+
+  test("Discard while a copy is still in flight warns as if it had landed", async ({
+    page,
+  }) => {
+    await slowClipboard(page, 4_000);
+    await page.goto("/");
+    await waitForApp(page);
+    await page.locator('[data-testid="fm-id-create"]').click();
+    await page.locator('[data-testid="fm-create-alias-input"]').fill("slowcopy");
+    await page.locator('[data-testid="fm-create-submit"]').click();
+    await page.locator('[data-testid="fm-create-backup-now"]').click();
+    const panel = page.locator('[data-testid="fm-backup-panel"]');
+
+    await panel.locator('[data-testid="fm-backup-copy"]').click();
+    // Nothing has settled yet...
+    await expect(panel.locator('[data-testid="fm-backup-status"]')).toHaveText("");
+    // ...but the key may still reach the clipboard, so Discard must warn.
+    await page.getByRole("button", { name: "Discard", exact: true }).click();
+    await expect(page.getByText("Discard backed-up identity?")).toBeVisible();
+  });
+
+  // Review #349 round 3, sequence A: the discard dialog unmounts the panel
+  // while its copy is in flight. When that copy then FAILS, nothing reached
+  // the clipboard, so a later Discard must not warn.
+  test("a copy that fails after the discard dialog unmounted the panel doesn't leave a stale warning", async ({
+    page,
+  }) => {
+    await manualClipboard(page);
+    const panel = await startCreateWithPanel(page, "seqa");
+    const discard = page.locator('[data-testid="fm-create-discard"]');
+    const warning = page.getByText("Discard backed-up identity?");
+
+    await panel.locator('[data-testid="fm-backup-copy"]').click();
+    await expect.poll(() => copiesStarted(page)).toBe(1);
+    await expect(discard).toHaveAttribute("data-copies-in-flight", "1");
+    await discard.click();
+    await expect(warning).toBeVisible();
+    await page.getByRole("button", { name: "Go back" }).click();
+
+    // The first copy fails while its panel is gone (a new one is mounted).
+    await settleCopy(page, 0, false);
+    await expect(discard).toHaveAttribute("data-copies-in-flight", "0");
+    await expect(discard).toHaveAttribute("data-key-exported", "false");
+    await discard.click();
+    await expect(warning).toHaveCount(0);
+    await expect(page.locator('[data-testid="fm-id-create"]')).toBeVisible();
+  });
+
+  // Sequence B: copy 1 is in flight across the remount; copy 2 from the
+  // remounted panel fails first. Copy 1 may still land, and then does, so
+  // Discard must keep warning throughout, first because copy 1 is in
+  // flight and then because it landed.
+  test("a later failed copy can't clear the warning for an earlier copy still in flight", async ({
+    page,
+  }) => {
+    await manualClipboard(page);
+    const panel = await startCreateWithPanel(page, "seqb");
+    const discard = page.locator('[data-testid="fm-create-discard"]');
+    const warning = page.getByText("Discard backed-up identity?");
+    const goBack = page.getByRole("button", { name: "Go back" });
+
+    await panel.locator('[data-testid="fm-backup-copy"]').click();
+    await expect.poll(() => copiesStarted(page)).toBe(1);
+    await discard.click();
+    await expect(warning).toBeVisible();
+    await goBack.click();
+
+    // Copy 2, on the remounted panel, fails.
+    await panel.locator('[data-testid="fm-backup-copy"]').click();
+    await expect.poll(() => copiesStarted(page)).toBe(2);
+    await settleCopy(page, 1, false);
+    await expect(panel.locator('[data-testid="fm-backup-status"]')).toContainText(
+      "Couldn't copy",
+    );
+    // Copy 1 is still in flight: nothing landed yet, but Discard warns.
+    await expect(discard).toHaveAttribute("data-copies-in-flight", "1");
+    await expect(discard).toHaveAttribute("data-key-exported", "false");
+    await discard.click();
+    await expect(warning).toBeVisible();
+    await goBack.click();
+
+    // Copy 1 lands after its panel was unmounted: now it counts as landed,
+    // and Discard warns for that reason.
+    await settleCopy(page, 0, true);
+    await expect(discard).toHaveAttribute("data-copies-in-flight", "0");
+    await expect(discard).toHaveAttribute("data-key-exported", "true");
+    await discard.click();
+    await expect(warning).toBeVisible();
+  });
+
+  // A copy of a DISCARDED key that lands later must not count against the
+  // next key: the reachable discard path, end to end. (Generating again
+  // with the same create flow mounted isn't possible in the UI: once keys
+  // are revealed, both Discard paths and Continue close the form.) This
+  // test checks the user-visible result only; it doesn't pin which guard
+  // stops the report. The tracker-access arms are unit-tested in
+  // backup_panel.rs (`classify_tracker_write_covers_every_error_variant`).
+  test("a copy of a discarded key that lands later doesn't mark the next key as copied", async ({
+    page,
+  }) => {
+    await manualClipboard(page);
+    const panel = await startCreateWithPanel(page, "oldkey");
+    const discard = page.locator('[data-testid="fm-create-discard"]');
+
+    await panel.locator('[data-testid="fm-backup-copy"]').click();
+    await expect.poll(() => copiesStarted(page)).toBe(1);
+    await discard.click();
+    await page.getByRole("button", { name: "Discard anyway" }).click();
+    await expect(page.locator('[data-testid="fm-id-create"]')).toBeVisible();
+
+    // A new identity, then the OLD copy succeeds.
+    await page.locator('[data-testid="fm-id-create"]').click();
+    await page.locator('[data-testid="fm-create-alias-input"]').fill("newkey");
+    await page.locator('[data-testid="fm-create-submit"]').click();
+    await expect(discard).toHaveAttribute("data-key-exported", "false");
+    await settleCopy(page, 0, true);
+
+    // Proof the settle ran before we look: a copy started now gets the next
+    // slot and settles too, after the old one.
+    await page.locator('[data-testid="fm-create-backup-now"]').click();
+    await panel.locator('[data-testid="fm-backup-copy"]').click();
+    await expect.poll(() => copiesStarted(page)).toBe(2);
+    await settleCopy(page, 1, false);
+    await expect(panel.locator('[data-testid="fm-backup-status"]')).toContainText(
+      "Couldn't copy",
+    );
+    await expect(discard).toHaveAttribute("data-copies-in-flight", "0");
+    await expect(discard).toHaveAttribute("data-key-exported", "false");
+    await discard.click();
+    await expect(page.getByText("Discard backed-up identity?")).toHaveCount(0);
+  });
+
+  test("the download gap is app-wide: a second key within 2s is refused, not silently lost", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    let downloads = 0;
+    page.on("download", () => {
+      downloads += 1;
+    });
+    const modal = page.locator('[data-testid="fm-backup-modal"]');
+
+    await page
+      .locator('[data-testid="fm-id-row"][data-alias="address1"] [data-testid="fm-id-backup"]')
+      .click();
+    await modal.locator('[data-testid="fm-backup-download"]').click();
+    await expect(modal.locator('[data-testid="fm-backup-status"]')).toContainText(
+      "Downloading freenet-identity-address1.txt",
+    );
+    await modal.getByRole("button", { name: "Close" }).click();
+
+    // A different identity's panel, straight away.
+    await page
+      .locator('[data-testid="fm-id-row"][data-alias="address2"] [data-testid="fm-id-backup"]')
+      .click();
+    await modal.locator('[data-testid="fm-backup-download"]').click();
+    const status = modal.locator('[data-testid="fm-backup-status"]');
+    // A notice, not a failure.
+    await expect(status).toContainText(
+      "Another download just went out. Wait a moment and try again.",
+    );
+    await expect(status).not.toContainText("Downloading");
+    await expect(status).not.toContainText("failed");
+    expect(downloads).toBe(1);
+
+    // Once the gap has passed it goes through. Retry until it does, rather
+    // than sleeping a guessed interval; a refused attempt doesn't restart
+    // the gap.
+    const download = modal.locator('[data-testid="fm-backup-download"]');
+    await expect(async () => {
+      await expect(download).toBeEnabled();
+      await download.click();
+      await expect(status).toContainText("Downloading freenet-identity-address2.txt", {
+        timeout: 500,
+      });
+    }).toPass({ timeout: 10_000 });
+    await expect.poll(() => downloads).toBe(2);
+  });
+
+  test("create flow: confirming the backup before creating clears the Settings banner", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await page.locator('[data-testid="fm-id-create"]').click();
+    await page.locator('[data-testid="fm-create-alias-input"]').fill("mira");
+    await page.locator('[data-testid="fm-create-submit"]').click();
+    await expect(page.getByText("Your fingerprint")).toBeVisible({ timeout: 5_000 });
+
+    await expect(page.locator('[data-testid="fm-backup-panel"]')).toHaveCount(0);
+    await page.locator('[data-testid="fm-create-backup-now"]').click();
+    const panel = page.locator('[data-testid="fm-backup-panel"]');
+    await expect(panel).toBeVisible();
+    await expect(panel.locator('[data-testid="fm-backup-entry-title"]')).toContainText(
+      "Freenet Mail: mira (",
+    );
+
+    // Copying marks the key as having left the browser, so Discard warns.
+    await panel.locator('[data-testid="fm-backup-copy"]').click();
+    await expect(panel.locator('[data-testid="fm-backup-status"]')).toContainText(
+      "Copied.",
+    );
+    await page.getByRole("button", { name: "Discard", exact: true }).click();
+    await expect(page.getByText("Discard backed-up identity?")).toBeVisible();
+    await page.getByRole("button", { name: "Go back" }).click();
+
+    await panel.locator('[data-testid="fm-backup-saved"]').click();
+    await expect(panel.locator('[data-testid="fm-backup-saved-note"]')).toBeVisible();
+    await page.locator('[data-testid="fm-create-confirm"]').click();
+
+    await expect(
+      page.locator('[data-testid="fm-id-row"][data-alias="mira"]'),
+    ).toBeVisible();
+    await selectIdentity(page, "mira");
+    await openAccountSettings(page);
+    await expect(page.getByText(NOT_BACKED_UP)).toHaveCount(0);
+  });
+
+  test("create flow: copying without confirming leaves the identity not backed up", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await page.locator('[data-testid="fm-id-create"]').click();
+    await page.locator('[data-testid="fm-create-alias-input"]').fill("lena");
+    await page.locator('[data-testid="fm-create-submit"]').click();
+    await page.locator('[data-testid="fm-create-backup-now"]').click();
+    const panel = page.locator('[data-testid="fm-backup-panel"]');
+    await panel.locator('[data-testid="fm-backup-copy"]').click();
+    await expect(panel.locator('[data-testid="fm-backup-status"]')).toContainText(
+      "Copied.",
+    );
+    await page.locator('[data-testid="fm-create-confirm"]').click();
+
+    await selectIdentity(page, "lena");
+    await openAccountSettings(page);
+    await expect(page.getByText(NOT_BACKED_UP)).toBeVisible();
+  });
+
+  test("settings: Back up now opens the panel; download alone isn't a backup; confirming is", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await waitForApp(page);
+    await selectIdentity(page, "address1");
+    await openAccountSettings(page);
+
+    const banner = page.getByText(NOT_BACKED_UP);
+    await expect(banner).toBeVisible();
+    await page.locator('[data-testid="fm-settings-backup"]').click();
+    const panel = page.locator('[data-testid="fm-backup-panel"]');
+    await expect(panel).toBeVisible();
+    // The button sits at the bottom of a scrolled screen and the panel opens
+    // at the top: it must be scrolled into view, not left off-screen.
+    await expect(panel).toBeInViewport();
+
+    // Scroll away and press Back up now again: the open panel comes back.
+    await page.locator('[data-testid="fm-settings-backup"]').scrollIntoViewIfNeeded();
+    await expect(panel).not.toBeInViewport();
+    await page.locator('[data-testid="fm-settings-backup"]').click();
+    await expect(panel).toBeInViewport();
+
+    // The downloaded file holds exactly the recovery key.
+    await panel.locator('[data-testid="fm-backup-reveal"]').click();
+    const token = (await panel.locator('[data-testid="fm-backup-key"]').innerText()).trim();
+    const downloadEvent = page.waitForEvent("download");
+    await panel.locator('[data-testid="fm-backup-download"]').click();
+    const download = await downloadEvent;
+    expect(download.suggestedFilename()).toBe("freenet-identity-address1.txt");
+    const content = fs.readFileSync((await download.path())!, "utf8");
+    expect(content).toBe(`${token}\n`);
+    await expect(panel.locator('[data-testid="fm-backup-status"]')).toContainText(
+      "freenet-identity-address1.txt",
+    );
+
+    // Downloading is not a backup confirmation.
+    await page.locator(".bk-card-body").getByRole("button", { name: "Close" }).click();
+    await expect(banner).toBeVisible();
+    await expect(page.locator(".fm-row-set", { hasText: "Last backup" })).toContainText(
+      "Never",
+    );
+
+    await page.locator('[data-testid="fm-settings-backup"]').click();
+    await panel.locator('[data-testid="fm-backup-saved"]').click();
+    await expect(panel).toHaveCount(0);
+    await expect(banner).toHaveCount(0);
+    await expect(
+      page.locator(".fm-row-set", { hasText: "Last backup" }),
+    ).not.toContainText("Never");
+  });
+
+  test("settings: switching identity closes the panel and can't mark the other identity", async ({
+    page,
+    isMobile,
+  }) => {
+    test.skip(isMobile, "the settings identity switcher is desktop-only");
+    await page.goto("/");
+    await waitForApp(page);
+    await selectIdentity(page, "address1");
+    await openAccountSettings(page);
+
+    await page.locator('[data-testid="fm-settings-backup"]').click();
+    const panel = page.locator('[data-testid="fm-backup-panel"]');
+    await panel.locator('[data-testid="fm-backup-reveal"]').click();
+    await panel.locator('[data-testid="fm-backup-copy"]').click();
+    await expect(panel.locator('[data-testid="fm-backup-status"]')).toContainText(
+      "Copied.",
+    );
+
+    // Switch to address2 from the settings sidebar.
+    await page.locator('[data-testid="fm-settings-ident-switcher"]').click();
+    await page.getByRole("option", { name: /address2/ }).click();
+    await expect(page.locator(".fm-set-ident-name")).toHaveText("address2");
+
+    // The panel closed with the switch; address2 is still not backed up.
+    await expect(panel).toHaveCount(0);
+    await expect(page.getByText(NOT_BACKED_UP)).toBeVisible();
+    await expect(page.locator(".fm-row-set", { hasText: "Last backup" })).toContainText(
+      "Never",
+    );
+
+    // Opening it for address2 starts fresh: key hidden, nothing copied.
+    await page.locator('[data-testid="fm-settings-backup"]').click();
+    await expect(panel.locator('[data-testid="fm-backup-key-masked"]')).toBeVisible();
+    await expect(panel.locator('[data-testid="fm-backup-copy"]')).toHaveText(
+      "Copy recovery key",
+    );
+    await expect(panel.locator('[data-testid="fm-backup-entry-title"]')).toContainText(
+      "address2",
+    );
+
+    // Back on address1, its panel is closed and it was never confirmed.
+    await page.locator('[data-testid="fm-settings-ident-switcher"]').click();
+    await page.getByRole("option", { name: /address1/ }).click();
+    await expect(page.locator(".fm-set-ident-name")).toHaveText("address1");
+    await expect(panel).toHaveCount(0);
+    await expect(page.getByText(NOT_BACKED_UP)).toBeVisible();
+  });
+
+  test("settings: after switching identity, the screen shows and edits the NEW identity's settings", async ({
+    page,
+    isMobile,
+  }) => {
+    test.skip(isMobile, "the settings identity switcher is desktop-only");
+    await page.goto("/");
+    await waitForApp(page);
+    await selectIdentity(page, "address1");
+    await openAccountSettings(page);
+    const lastBackup = page.locator(".fm-row-set", { hasText: "Last backup" });
+    const signature = page.locator(".fm-row-set", { hasText: "Signature" }).locator("textarea");
+    const autoSign = page
+      .locator(".fm-row-set", { hasText: "Append signature to new messages" })
+      .locator('[role="switch"]');
+    const switchTo = async (alias: string) => {
+      await page.locator('[data-testid="fm-settings-ident-switcher"]').click();
+      await page.getByRole("option", { name: new RegExp(alias) }).click();
+      await expect(page.locator(".fm-set-ident-name")).toHaveText(alias);
+    };
+
+    // address1: backed up, with a signature.
+    await page.locator('[data-testid="fm-settings-backup"]').click();
+    await page.locator('[data-testid="fm-backup-saved"]').click();
+    await expect(page.getByText(NOT_BACKED_UP)).toHaveCount(0);
+    await signature.fill("signed, address1");
+    const aBackup = await lastBackup.innerText();
+    expect(aBackup).not.toContain("Never");
+
+    // address2 shows ITS state: not backed up, no signature.
+    await switchTo("address2");
+    await expect(page.getByText(NOT_BACKED_UP)).toBeVisible();
+    await expect(lastBackup).toContainText("Never");
+    await expect(signature).toHaveValue("");
+
+    // An edit on address2 must not copy address1's record onto it.
+    const before = await autoSign.getAttribute("aria-checked");
+    await autoSign.click();
+    await expect(autoSign).not.toHaveAttribute("aria-checked", before!);
+    await expect(page.getByText(NOT_BACKED_UP)).toBeVisible();
+    await expect(lastBackup).toContainText("Never");
+    await expect(signature).toHaveValue("");
+
+    // address1 is unchanged by any of that.
+    await switchTo("address1");
+    await expect(signature).toHaveValue("signed, address1");
+    await expect(page.getByText(NOT_BACKED_UP)).toHaveCount(0);
+    expect(await lastBackup.innerText()).toBe(aBackup);
+  });
+});
+
+// The gateway serves the app inside an iframe and relays clipboard writes
+// and downloads for it. Those messages carry the private key, so they must
+// be addressed to the gateway's origin, never "*". A stand-in shell page
+// records what the app frame posts to it.
+test.describe("Gateway shell relays (#349)", () => {
+  function shellPage(appUrl: string): string {
+    return `<!doctype html><html><body style="margin:0">
+<iframe id="app" src="${appUrl}" style="width:100vw;height:100vh;border:0"></iframe>
+<script>
+  window.__msgs = [];
+  window.addEventListener("message", (e) => {
+    // Same acceptance rule as freenet-core's shell_bridge.js.
+    if (e.source !== document.getElementById("app").contentWindow) return;
+    window.__msgs.push(e.data);
+  });
+</script></body></html>`;
+  }
+
+  async function openBackupInFrame(page: Page) {
+    const app = page.frameLocator("iframe#app");
+    await app.locator(".brand-name").first().waitFor({ timeout: 60_000 });
+    await app
+      .locator('[data-testid="fm-id-row"][data-alias="address1"] [data-testid="fm-id-backup"]')
+      .click();
+    return app.locator('[data-testid="fm-backup-panel"]');
+  }
+
+  test("a same-origin shell receives the clipboard and download relays", async ({
+    page,
+    baseURL,
+  }) => {
+    await breakLocalClipboard(page);
+    const origin = new URL(baseURL!).origin;
+    await page.route(`${origin}/__shell`, (route) =>
+      route.fulfill({ contentType: "text/html", body: shellPage(`${origin}/`) }),
+    );
+    await page.goto(`${origin}/__shell`);
+    const panel = await openBackupInFrame(page);
+
+    await panel.locator('[data-testid="fm-backup-copy"]').click();
+    // The shell can't confirm, and the panel says so.
+    await expect(panel.locator('[data-testid="fm-backup-status"]')).toContainText(
+      "Sent to your clipboard through Freenet",
+    );
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          (window as unknown as { __msgs: Array<Record<string, unknown>> }).__msgs.map(
+            (m) => `${m.type}:${String(m.text ?? m.mimeType ?? "").slice(0, 12)}`,
+          ),
+        ),
+      )
+      .toContain("clipboard:fmail-key-1:");
+
+    await panel.locator('[data-testid="fm-backup-download"]').click();
+    await expect
+      .poll(() =>
+        page.evaluate(() =>
+          (window as unknown as { __msgs: Array<Record<string, unknown>> }).__msgs.map(
+            (m) => `${m.type}:${String(m.mimeType ?? "")}`,
+          ),
+        ),
+      )
+      .toContain("download:text/plain");
+    // A relayed download can't be confirmed, so the panel doesn't claim it.
+    const status = panel.locator('[data-testid="fm-backup-status"]');
+    await expect(status).toContainText("Asked Freenet to save freenet-identity-address1.txt");
+    await expect(status).not.toContainText("Downloading");
+  });
+
+  test("a shell on another origin receives nothing", async ({ page, baseURL }) => {
+    await breakLocalClipboard(page);
+    const devOrigin = new URL(baseURL!).origin;
+    // Serve the app from a different origin (proxied to the dev server), so
+    // the framing page is NOT the app's gateway. Chromium refuses to frame
+    // a second loopback origin directly, hence the proxy.
+    const appOrigin = "http://app.test";
+    await page.route(`${appOrigin}/**`, async (route) => {
+      const url = route.request().url().replace(appOrigin, devOrigin);
+      await route.fulfill({ response: await route.fetch({ url }) });
+    });
+    await page.route(`${devOrigin}/__shell`, (route) =>
+      route.fulfill({ contentType: "text/html", body: shellPage(`${appOrigin}/`) }),
+    );
+    await page.goto(`${devOrigin}/__shell`);
+    const panel = await openBackupInFrame(page);
+
+    await panel.locator('[data-testid="fm-backup-copy"]').click();
+    await expect(panel.locator('[data-testid="fm-backup-status"]')).toContainText(
+      "Sent to your clipboard through Freenet",
+    );
+    await panel.locator('[data-testid="fm-backup-download"]').click();
+    // Positive control instead of a sleep: messages from one window are
+    // delivered in order, so once a marker the app frame posts AFTER the
+    // relays has arrived, any relay that was going to arrive already has.
+    const appFrame = page.frames().find((f) => f.url().startsWith(appOrigin))!;
+    await appFrame.evaluate(() => window.parent.postMessage({ __marker: true }, "*"));
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (window as unknown as { __msgs: Array<Record<string, unknown>> }).__msgs.length,
+        ),
+      )
+      .toBe(1);
+    expect(
+      await page.evaluate(
+        () =>
+          (window as unknown as { __msgs: Array<Record<string, unknown>> }).__msgs[0]
+            .__marker,
+      ),
+    ).toBe(true);
   });
 });
 

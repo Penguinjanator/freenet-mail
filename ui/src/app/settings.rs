@@ -26,23 +26,31 @@ use crate::app::menu;
 use crate::local_state;
 use crate::testid;
 
-/// Read the identity-settings bucket for the active identity. Re-runs when
-/// `local_state::GENERATION` advances, so an external refresh of the
-/// snapshot (e.g. delegate `GetAll` reply) re-renders dependent screens.
+/// Read the identity-settings bucket for the active identity, with that
+/// identity's alias. Re-runs when `local_state::GENERATION` advances (an
+/// external refresh of the snapshot, e.g. a delegate `GetAll` reply) AND
+/// when the active identity changes.
+///
+/// The alias must be read INSIDE the memo. It used to be captured once
+/// outside it, so after switching identity in the sidebar the screen kept
+/// the first identity's settings: Settings showed A's "Last backup" for B,
+/// and any edit on B (signature, auto-sign, ...) wrote A's whole settings
+/// record under B's alias, copying A's backup date and signature onto B.
 fn use_identity_settings() -> (String, IdentitySettings) {
     let user = use_context::<Signal<User>>();
-    let alias = user
-        .read()
-        .logged_id()
-        .map(|id| id.alias.to_string())
-        .unwrap_or_default();
-    let alias_for_memo = alias.clone();
     let settings = use_memo(move || {
         // Subscribe to GENERATION so this re-runs on snapshot mutation.
         let _gen = local_state::GENERATION();
-        local_state::identity_settings_for(&alias_for_memo)
+        // Subscribe to the user signal so it re-runs on identity switch.
+        let alias = user
+            .read()
+            .logged_id()
+            .map(|id| id.alias.to_string())
+            .unwrap_or_default();
+        let settings = local_state::identity_settings_for(&alias);
+        (alias, settings)
     });
-    (alias, settings())
+    settings()
 }
 
 fn use_global_settings() -> GlobalSettings {
@@ -172,10 +180,15 @@ pub(crate) fn SettingsShell() -> Element {
             main { class: "fm-set-main",
                 BarHeader { current: screen, alias: alias.clone() }
                 div { class: "fm-set-body",
+                    // The screens that read per-identity settings
+                    // (`use_identity_settings`) are keyed by alias so a
+                    // switch remounts them: no local state (open backup
+                    // panel, half-edited fields) survives into another
+                    // identity. The rest read only global settings.
                     match screen {
-                        menu::SettingsScreen::Account => rsx! { ScrAccount {} },
-                        menu::SettingsScreen::Privacy => rsx! { ScrPrivacy {} },
-                        menu::SettingsScreen::Aft => rsx! { ScrAft {} },
+                        menu::SettingsScreen::Account => rsx! { ScrAccount { key: "{alias}" } },
+                        menu::SettingsScreen::Privacy => rsx! { ScrPrivacy { key: "{alias}" } },
+                        menu::SettingsScreen::Aft => rsx! { ScrAft { key: "{alias}" } },
                         menu::SettingsScreen::Inbox => rsx! { ScrInbox {} },
                         menu::SettingsScreen::Contacts => rsx! { ScrContacts {} },
                         menu::SettingsScreen::Appearance => rsx! { ScrAppearance {} },
@@ -408,33 +421,45 @@ fn ScrAccount() -> Element {
         local_state::persist_identity_settings(alias_key_as.clone(), next);
     };
 
-    // Back-up: serialise the active identity to JSON, trigger a browser
-    // download, then stamp `last_backup_at` so the amber banner stops
-    // showing and the "Last backup" row updates.
-    let user_for_backup = user;
-    let alias_key_bk = alias_key.clone();
-    let ident_bk = ident.clone();
-    let on_backup = move |_| {
-        let Some(active) = user_for_backup.read().logged_id().cloned() else {
-            return;
-        };
-        let backup = crate::app::login::IdentityBackup::from_identity(&active);
-        let Ok(json) = serde_json::to_vec_pretty(&backup) else {
-            return;
-        };
-        let words = crate::app::address_book::fingerprint_words(
-            &active.ml_dsa_vk_bytes(),
-            &active.ml_kem_ek_bytes(),
-        );
-        let fname = crate::app::login::backup_filename(&active.alias, &words);
-        if let Err(e) = crate::app::login::trigger_browser_download(&fname, &json) {
-            crate::log::info(format!("Backup download failed: {e}"));
-            return;
+    // Back-up: open the recovery-key panel at the top of this screen.
+    // `last_backup_at` is stamped only when the user confirms "I've saved
+    // it" in the panel (see `login::mark_backed_up`), so the amber banner
+    // and the "Last backup" row reflect a confirmed backup, not a click.
+    //
+    // The panel belongs to ONE identity. SettingsShell keys this screen by
+    // alias, so switching identity remounts it and the open panel, its
+    // Copied state and its "I've saved it" button can't carry over (a user
+    // could otherwise copy A's key and then mark B as backed up). As a
+    // second guard that doesn't depend on that key, `backup_for` records
+    // which identity the panel was opened for (by verifying-key prefix)
+    // and it only shows for that one.
+    let mut backup_for: Signal<Option<String>> = use_signal(|| None);
+    let mut backup_scroll = use_signal(|| 0u32);
+    let backup_open = backup_for.read().as_deref() == Some(vk_seed.as_str()) && !vk_seed.is_empty();
+    let on_backup = {
+        let vk_seed = vk_seed.clone();
+        move |_| {
+            if backup_for.peek().as_deref() == Some(vk_seed.as_str()) {
+                // Already open (perhaps scrolled out of view): bring it back.
+                let next = backup_scroll.peek().wrapping_add(1);
+                backup_scroll.set(next);
+            } else {
+                backup_for.set(Some(vk_seed.clone()));
+            }
         }
-        let mut next = ident_bk.clone();
-        next.last_backup_at = Some(chrono::Utc::now().timestamp_millis());
-        local_state::persist_identity_settings(alias_key_bk.clone(), next);
     };
+    let backup_panel: Option<(Result<String, String>, Vec<String>)> = if backup_open {
+        user.read().logged_id().map(|active| {
+            (
+                crate::app::login::recovery_key_for(active),
+                crate::app::login::fingerprint_word_vec(active),
+            )
+        })
+    } else {
+        None
+    };
+    let alias_for_panel = alias.clone();
+    let panel_key = vk_seed.clone();
 
     // Restore: route through the existing import-backup modal; close
     // settings so the modal is visible over the login pane.
@@ -450,7 +475,48 @@ fn ScrAccount() -> Element {
             p { class: "fm-set-lede",
                 "Identity-scoped settings. These follow this identity across devices once sync lands. Switch the active identity in the sidebar to edit a different one."
             }
-            if !backed_up {
+            if let Some((token, words)) = backup_panel {
+                Card {
+                    title: "Recovery key",
+                    sub: "Both private keys for this identity, as one line of text.",
+                    div { class: "bk-card-body",
+                        match token {
+                            Ok(token) => rsx! {
+                                crate::app::backup_panel::BackupKeyPanel {
+                                    // Keyed by identity: a different identity
+                                    // gets a fresh panel (hidden key, no
+                                    // stale "Copied"), never this one's state.
+                                    key: "{panel_key}",
+                                    token,
+                                    alias: alias_for_panel.clone(),
+                                    words,
+                                    saved: false,
+                                    scroll_request: *backup_scroll.read(),
+                                    on_exported: move |_| {},
+                                    on_saved: {
+                                        let alias = alias_for_panel.clone();
+                                        move |_| {
+                                            crate::app::login::mark_backed_up(&alias);
+                                            backup_for.set(None);
+                                        }
+                                    },
+                                }
+                            },
+                            Err(e) => rsx! {
+                                p { class: "bk-status err", "Couldn't build a recovery key for this identity: {e}" }
+                            },
+                        }
+                        div { class: "bk-actions",
+                            button {
+                                class: "fm-btn-secondary",
+                                r#type: "button",
+                                onclick: move |_| backup_for.set(None),
+                                "Close"
+                            }
+                        }
+                    }
+                }
+            } else if !backed_up {
                 div { class: "fm-banner amber",
                     span { class: "fm-banner-glyph", "!" }
                     div { class: "fm-banner-text",
@@ -460,6 +526,7 @@ fn ScrAccount() -> Element {
                     div { class: "fm-banner-actions",
                         button {
                             class: "fm-btn-primary",
+                            "data-testid": testid::FM_SETTINGS_BACKUP_BANNER,
                             onclick: on_backup.clone(),
                             "Back up now"
                         }
@@ -518,13 +585,14 @@ fn ScrAccount() -> Element {
             }
             Card {
                 title: "Backup & restore",
-                sub: "Backups are an encrypted bundle of both keys. There's no server-side recovery; lose this and the alias is gone.",
+                sub: "Your recovery key holds both private keys. Keep it in a password manager: there's no server-side recovery, so if you lose it the alias is gone.",
                 SettingRow {
                     label: "Last backup",
                     help: last_backup_label.clone(),
                     control: rsx! {
                         button {
                             class: "fm-btn-primary",
+                            "data-testid": testid::FM_SETTINGS_BACKUP,
                             onclick: on_backup,
                             "Back up now"
                         }
@@ -532,7 +600,7 @@ fn ScrAccount() -> Element {
                 }
                 SettingRow {
                     label: "Restore from backup",
-                    help: "Replaces the active identity's keys. The current keys will be unrecoverable after this.",
+                    help: "Adds an identity from a recovery key or backup file. Existing identities are not changed.",
                     control: rsx! {
                         button {
                             class: "fm-btn-secondary",
