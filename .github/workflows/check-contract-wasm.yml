@@ -23,6 +23,10 @@ on:
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
       - 'modules/**'
+      - 'delegates/**'
+      - 'protocol/**'
+      - 'wire-v1/**'
+      - 'scripts/**'
       - 'contracts/inbox/**'
       - 'contracts/.cargo/**'
       - 'wire-v1/**'
@@ -169,6 +173,27 @@ jobs:
       # scripts/check-wasm-paths.sh keep working. The output is discarded.
       - name: Build contract and delegate WASM reproducibly
         run: bash scripts/check-wasm-builds.sh
+
+      # The mail delegate is the next generation, still changing until the
+      # v0.3.0 release freezes it. Its committed candidate WASM is what the
+      # UI will embed and its bytes are its key, so it must be exactly what
+      # the reviewed source builds.
+      - name: Verify the mail-delegate candidate is the source's build
+        run: bash scripts/check-delegate-candidate.sh
+
+      # A guard only ever seen passing is not known to work. This applies,
+      # to a staged copy, the regression each delegate guard exists to catch
+      # (and runs the release guard's tests) and requires each to fail.
+      - name: Show each mail-delegate guard failing when broken
+        run: bash scripts/check-guards-fail.sh
+
+      - name: Upload the rebuilt mail-delegate candidate
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mail-delegate-candidate-${{ github.sha }}
+          path: target/delegate-candidate-rebuilt/
+          if-no-files-found: ignore
 
       # Issue #206 (closes the Phase 1 informational gate). The container
       # contract id is intended to stay byte-stable across releases.

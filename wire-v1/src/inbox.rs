@@ -19,7 +19,7 @@ use crate::aft::{Tier, TokenAssignment, TokenAssignmentHash};
 /// this inbox can be verified on updates. Value is arbitrary but must stay
 /// constant across versions — it's part of the signed-payload convention, so
 /// changing it would invalidate every existing inbox signature.
-const STATE_UPDATE: &[u8; 8] = &[168, 7, 13, 64, 168, 123, 142, 215];
+pub const STATE_UPDATE: &[u8; 8] = &[168, 7, 13, 64, 168, 123, 142, 215];
 
 /// The owner's ML-DSA-65 verifying key. Stored on-wire as the FIPS 204
 /// encoded byte array (1952 bytes for ML-DSA-65) to avoid a custom serde
@@ -197,6 +197,13 @@ pub struct Inbox {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub owner_ek_bytes: Vec<u8>,
     inbox_signature: Signature,
+}
+
+/// Bytes the inbox owner signs for `UpdateInbox::RemoveMessages`: the
+/// assignment hashes concatenated in order, as the frozen inbox contract's
+/// `can_reemove_messages` rebuilds them. There is no domain tag.
+pub fn removal_payload(ids: &[TokenAssignmentHash]) -> Vec<u8> {
+    ids.concat()
 }
 
 /// Canonical bytes the inbox owner signs to authorize a state: the

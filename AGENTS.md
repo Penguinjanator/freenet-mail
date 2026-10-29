@@ -45,6 +45,48 @@ files and the procedure for adding a generation.
   change what ships until the UI's includes point at a new generation.
   Clippy and tests still cover that source.
 
+### The mail delegate
+
+`delegates/mail-delegate` holds every identity's private keys, the contacts
+and the local mail state (drafts, sent, kept, archived, flags, settings). It
+signs and decrypts on the UI's behalf; keys leave it only through an export
+the user approves. The UI and the delegate speak the CBOR protocol in
+`protocol/` (`freenet-mail-protocol`), which also holds the `fmail-key-1:`
+recovery-key codec. Its encoding is pinned per variant in
+`protocol/src/golden_v1.txt` (append-only).
+
+- **Origin gate:** only an attested web-app origin is served, and it names
+  the namespace (`o/<origin hex>/`) every key lives in.
+- **No host listing:** the host caps key enumeration at 4096 for the whole
+  delegate, does not page, and returns an empty list on error. The delegate
+  never lists: every set of items has an index record it maintains itself,
+  and listing, caps and exports read those.
+- **Budgets:** every key an origin writes goes through `store::Space`, which
+  enforces a per-origin key and byte budget, so one app cannot exhaust
+  storage for another.
+- **Compare-and-swap:** every record, index records included, carries a
+  generation that is checked on write. Generations come from a per-origin
+  counter and are never reused.
+- **Responses:** every request gets exactly one response, including a typed
+  one for a protocol version or operation this build does not know.
+- **Consent:** exports (recovery key, profile, successor export) prompt
+  unless the user chose "Always allow for this app"; deleting an identity
+  prompts every time and removes everything it owns.
+- **Randomness and time:** never add `getrandom` or `rand`. Randomness is the
+  host's `rand_bytes` mixed with entropy the UI sends; prompt expiry uses
+  the host clock.
+
+Its WASM lives under `published-contract/candidate/` until a release
+freezes it into `published-contract/wasm/v2/`.
+`scripts/check-delegate-candidate.sh` (CI `check-drift`) fails unless the
+committed bytes are exactly what the source builds. Rebuild it after
+changing the delegate, `protocol/` or `wire-v1/`
+(`published-contract/candidate/README.md`). `scripts/check-release-delegate.sh`,
+run by `release.sh`, refuses a release whose UI embeds the candidate or whose
+delegate was built with the `v1-transition` feature.
+`scripts/check-guards-fail.sh` shows each of these guards failing when what
+it guards is broken.
+
 The `legacy_*.toml` registries are validated by `ui/build.rs`
 (`freenet-migrate-build`; an empty registry fails the build) and pinned by
 `ui/src/legacy_registry.rs`. They are not read at runtime yet: the inbox and
