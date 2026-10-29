@@ -128,8 +128,10 @@ peers; used by `publish-email-test`/`publish-all`/tests) vs. `freenet network`
 ### Testing
 
 ```bash
-cargo test --workspace              # All tests
-cargo make test-inbox               # Inbox contract tests (outside the workspace, needs --features contract)
+cargo make test                     # All tests: the workspace, then every out-of-workspace crate
+cargo make clippy                   # Clippy on the same set
+cargo make test-inbox               # Inbox contract integration tests (needs --features contract)
+cargo make check-golden-capture     # Re-capture wire-v1's fixtures through the frozen crates
 cargo make test-ui-playwright       # Playwright E2E tests (build + serve + test)
 cargo make test-ui-playwright-setup # One-time: install Playwright browsers
 ```
@@ -345,22 +347,43 @@ extended to every other on-chain contract:
 - `modules/antiflood-tokens/delegates/token-generator/` — the AFT
   token-generator delegate.
 - `modules/antiflood-tokens/interfaces/` — shared aft-interface types
-  crate (analog of facade-types). Path-dep'd by all three contracts AND
-  by the workspace UI.
+  crate (analog of facade-types). Path-dep'd by all three contracts.
+- `modules/identity-management/` and `modules/mail-local-state/` — the
+  two local delegates.
+- `contracts/web-container/` — the webapp contract. It path-deps
+  `common/`, so its lockfile follows `common/`'s versions; CI's
+  `--locked` flags it when a root bump leaves it stale.
 
-All four are listed in `[workspace.exclude]`. Each has its own
+All of these are listed in `[workspace.exclude]`. Each has its own
 `Cargo.lock` and =x.y.z pins on every dep that influences wasm output
 (chrono, ml-dsa, freenet-stdlib, etc.). Each also has a one-line
 `[workspace]` stanza so `fdev`'s `get_workspace_target_dir()` walk
 doesn't panic.
 
 Net effect: bumping a workspace dep (dioxus, ml-kem) cannot reach the
-inbox or AFT build graphs. That does not make a rebuild reproducible
+inbox, AFT or delegate build graphs. The webapp contract is the exception:
+its `common/` path-dep follows root workspace bumps, so its lockfile can
+need refreshing (`--locked` in `scripts/check-excluded-crates.sh` flags
+that). What protects every deployed contract, that one included, is that
+the shipped bytes are frozen. Lockfile isolation does not make a rebuild reproducible
 (embedded build paths, #348), which is why the shipped bytes are frozen
 under `published-contract/wasm/v1/` and the UI embeds those, never a fresh
 build. A deliberate rotation (e.g. a contract bugfix that needs a data
 migration) is a new generation: see "Frozen artifacts" above and
 `published-contract/README.md`.
+
+**Client wire types (`wire-v1/`)**: the excluded crates pin
+freenet-stdlib 0.3.5, so the UI does not link them. `wire-v1/` holds
+copies of their message, state and parameter types on the workspace
+stdlib, minus the contract and delegate implementations. Never change a
+serialized shape there: `golden_v1.txt` holds bytes captured through the
+frozen crates, and `ui/src/frozen_keys_v1.txt` holds the delegate and
+contract keys the v0.2.x client derived, and tests fail if either drifts.
+The committed `identity-manager-params` and `mail-local-state-params`
+bytes are sent as-is (the delegate key hashes them). The
+`getrandom_backend="custom"` cfg lives in `contracts/.cargo/` and
+`modules/.cargo/` (where those crates build), not at the root, because
+the UI's getrandom 0.4 needs its browser backend.
 
 **Inbox migration (#213/#223, shipped; #251 hardening)**: on UI
 startup the `set_aliases` callback in `ui/src/api.rs` compares the

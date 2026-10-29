@@ -32,4 +32,12 @@ for row in "${CRATES[@]}"; do
     echo "== $dir"
     scripts/build-wasm.sh "$dir" "$kind" "$features" "$OUT/$name"
 done
-echo "all contract and delegate crates build to WASM with no build-machine paths"
+# The webapp contract is an fdev "webapp" package, so fdev would package the
+# UI rather than compile the contract. Build it with cargo from its own
+# directory. (Its wasm graph has no getrandom, so the getrandom flag in
+# contracts/.cargo/config.toml does not affect it.)
+echo "== contracts/web-container"
+(cd contracts/web-container \
+    && CARGO_TARGET_DIR="$OUT/web-container-target" \
+        cargo build --locked --release --target wasm32-unknown-unknown)
+echo "all contract and delegate crates build to WASM (the fdev-built ones with no build-machine paths)"
