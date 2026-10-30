@@ -177,10 +177,54 @@ pub(crate) fn copy_report<G>(
     }
 }
 
+/// [`BackupKeyPanel`] for an existing identity, whose key the mail delegate
+/// reveals only after the user approves its prompt. The key is held by this
+/// component's resource, so it is dropped (and zeroized) when the panel
+/// closes.
+#[component]
+pub(crate) fn ExportedKeyPanel(
+    addr: freenet_mail_protocol::Addr,
+    alias: String,
+    words: Vec<String>,
+    saved: bool,
+    on_saved: EventHandler<()>,
+    #[props(default)] scroll_request: u32,
+) -> Element {
+    let token = use_resource(move || async move {
+        crate::mail_delegate::ops::export_recovery_key(addr)
+            .await
+            .map_err(|e| e.to_string())
+    });
+    match &*token.read() {
+        None => rsx! {
+            div { class: "info",
+                "data-testid": crate::testid::FM_BACKUP_WAITING,
+                "Approve showing the recovery key in the prompt from your Freenet node."
+            }
+        },
+        Some(Ok(token)) => rsx! {
+            BackupKeyPanel {
+                token: token.clone(),
+                alias: alias.clone(),
+                words: words.clone(),
+                saved,
+                scroll_request,
+                on_exported: move |_| {},
+                on_saved: move |_| on_saved.call(()),
+            }
+        },
+        Some(Err(e)) => rsx! {
+            div { class: "info fm-error",
+                "Couldn't show the recovery key for this identity: {e}"
+            }
+        },
+    }
+}
+
 #[component]
 pub(crate) fn BackupKeyPanel(
     /// The recovery key (`fmail-key-1:...`).
-    token: String,
+    token: crate::mail_delegate::ops::SecretString,
     /// Alias, for the entry title and download filename.
     alias: String,
     /// The identity's six fingerprint words.
@@ -304,7 +348,7 @@ pub(crate) fn BackupKeyPanel(
                 return;
             }
             let fname = super::login::backup_filename(&alias, &words);
-            let body = format!("{token}\n");
+            let body = zeroize::Zeroizing::new(format!("{}\n", token.as_str()));
             match super::login::trigger_browser_download(&fname, body.as_bytes(), "text/plain") {
                 Ok(route) => {
                     download_status.set(Some(Ok((fname, route))));
@@ -377,7 +421,7 @@ pub(crate) fn BackupKeyPanel(
                         "aria-multiline": "true",
                         "aria-labelledby": "{key_label_id}",
                         tabindex: "0",
-                        "{token}"
+                        "{token.as_str()}"
                     }
                 } else {
                     div {
@@ -386,7 +430,7 @@ pub(crate) fn BackupKeyPanel(
                         "data-testid": testid::FM_BACKUP_KEY_MASKED,
                         role: "img",
                         "aria-label": "Recovery key, hidden. Press Show key to display it.",
-                        "{masked(&token)}"
+                        "{masked(token.as_str())}"
                     }
                 }
                 span { class: "field-help",

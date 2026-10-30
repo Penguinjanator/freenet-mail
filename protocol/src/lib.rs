@@ -131,6 +131,10 @@ pub enum FailureCode {
     UnsupportedVersion,
     /// The request's operation is not one this delegate knows (a newer UI).
     UnknownOperation,
+    /// The item is listed but its stored bytes cannot be read (the host
+    /// reports a file it cannot read or decrypt as absent, every time).
+    /// Writing it with `expected_gen: None` replaces it.
+    Unreadable,
 }
 
 /// What kind of stored item. Each kind has its own key space, so an identity,
@@ -315,6 +319,19 @@ pub enum Op {
     /// Withdraw a remembered "Always allow for this app" for exports, and end
     /// any export session.
     RevokeExportGrant,
+    /// The identities whose deletion the user approved but which are not
+    /// gone yet (the deletion was interrupted). `ListIdentities` hides them;
+    /// `DeleteIdentity` finishes one without asking again.
+    ListDeletingIdentities,
+    /// Reset an index whose stored bytes can no longer be read, so the app
+    /// can be used again: the identity index (`kind: None`) or one kind's
+    /// index (with its owner). Asks the user every time. Refused while the
+    /// index reads fine. Records stay stored: an identity comes back by
+    /// importing it again (from its recovery key).
+    RepairIndex {
+        kind: Option<ItemKind>,
+        owner: Option<Addr>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -341,6 +358,16 @@ pub struct Status {
     pub key_budget: u64,
     pub byte_budget: u64,
     pub v1_transition: bool,
+    /// Identities listed but whose record cannot be used (unreadable, or
+    /// stored but not decodable). They are left out of `ListIdentities`;
+    /// importing their keys restores them. Added later: absent when zero,
+    /// so the earlier encoding is unchanged.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unreadable_identities: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -385,6 +412,15 @@ pub enum Reply {
     /// continue. `remaining` counts what is left.
     Continue {
         remaining: u32,
+    },
+    /// The answer to `CreateIdentity`: the new identity and its
+    /// `fmail-key-1:` recovery key. This is the one time a recovery key
+    /// leaves the delegate without a prompt, so the new identity can be
+    /// backed up as it is made; every later reveal is a consented
+    /// `ExportRecoveryKey`.
+    CreatedIdentity {
+        identity: IdentityInfo,
+        recovery_key: String,
     },
 }
 

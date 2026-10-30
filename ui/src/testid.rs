@@ -118,6 +118,8 @@ pub(crate) const FM_RESTORE_ERROR: &str = "fm-restore-error";
 pub(crate) const FM_RESTORE_ALIAS: &str = "fm-restore-alias";
 pub(crate) const FM_RESTORE_EXISTING: &str = "fm-restore-existing";
 pub(crate) const FM_BACKUP_MODAL: &str = "fm-backup-modal";
+/// Shown while the delegate's prompt to reveal a recovery key is open.
+pub(crate) const FM_BACKUP_WAITING: &str = "fm-backup-waiting";
 pub(crate) const FM_BACKUP_PANEL: &str = "fm-backup-panel";
 pub(crate) const FM_BACKUP_ENTRY_TITLE: &str = "fm-backup-entry-title";
 pub(crate) const FM_BACKUP_KEY: &str = "fm-backup-key";
@@ -130,6 +132,7 @@ pub(crate) const FM_BACKUP_SAVED: &str = "fm-backup-saved";
 pub(crate) const FM_BACKUP_SAVED_NOTE: &str = "fm-backup-saved-note";
 pub(crate) const FM_SETTINGS_BACKUP: &str = "fm-settings-backup";
 pub(crate) const FM_SETTINGS_BACKUP_BANNER: &str = "fm-settings-backup-banner";
+pub(crate) const FM_SETTINGS_REVOKE_EXPORT: &str = "fm-settings-revoke-export";
 
 // Identity rows
 pub(crate) const FM_ID_ROW: &str = "fm-id-row";
@@ -140,6 +143,12 @@ pub(crate) const FM_ID_RESTORE: &str = "fm-id-restore";
 pub(crate) const FM_ID_RENAME: &str = "fm-id-rename";
 pub(crate) const FM_ID_SHARE: &str = "fm-id-share";
 pub(crate) const FM_ID_DELETE: &str = "fm-id-delete";
+pub(crate) const FM_ID_UNFINISHED_DELETE: &str = "fm-id-unfinished-delete";
+pub(crate) const FM_ID_FINISH_DELETE: &str = "fm-id-finish-delete";
+pub(crate) const FM_ID_REPAIR_STORAGE: &str = "fm-id-repair-storage";
+pub(crate) const FM_ID_REPAIR_STORAGE_NOTE: &str = "fm-id-repair-storage-note";
+pub(crate) const FM_ID_REPAIR_LIST: &str = "fm-id-repair-list";
+pub(crate) const FM_ID_REPAIR_LIST_NOTE: &str = "fm-id-repair-list-note";
 pub(crate) const FM_RENAME_INPUT: &str = "fm-rename-input";
 pub(crate) const FM_RENAME_SUBMIT: &str = "fm-rename-submit";
 pub(crate) const FM_DELETE_CONFIRM_INPUT: &str = "fm-delete-confirm-input";
@@ -251,6 +260,7 @@ mod tests {
             ("fmRestoreAlias", super::FM_RESTORE_ALIAS),
             ("fmRestoreExisting", super::FM_RESTORE_EXISTING),
             ("fmBackupModal", super::FM_BACKUP_MODAL),
+            ("fmBackupWaiting", super::FM_BACKUP_WAITING),
             ("fmBackupPanel", super::FM_BACKUP_PANEL),
             ("fmBackupEntryTitle", super::FM_BACKUP_ENTRY_TITLE),
             ("fmBackupKey", super::FM_BACKUP_KEY),
@@ -263,6 +273,7 @@ mod tests {
             ("fmBackupSavedNote", super::FM_BACKUP_SAVED_NOTE),
             ("fmSettingsBackup", super::FM_SETTINGS_BACKUP),
             ("fmSettingsBackupBanner", super::FM_SETTINGS_BACKUP_BANNER),
+            ("fmSettingsRevokeExport", super::FM_SETTINGS_REVOKE_EXPORT),
             ("fmIdRow", super::FM_ID_ROW),
             ("fmIdOpen", super::FM_ID_OPEN),
             ("fmIdCreate", super::FM_ID_CREATE),
@@ -271,6 +282,12 @@ mod tests {
             ("fmIdRename", super::FM_ID_RENAME),
             ("fmIdShare", super::FM_ID_SHARE),
             ("fmIdDelete", super::FM_ID_DELETE),
+            ("fmIdUnfinishedDelete", super::FM_ID_UNFINISHED_DELETE),
+            ("fmIdFinishDelete", super::FM_ID_FINISH_DELETE),
+            ("fmIdRepairStorage", super::FM_ID_REPAIR_STORAGE),
+            ("fmIdRepairStorageNote", super::FM_ID_REPAIR_STORAGE_NOTE),
+            ("fmIdRepairList", super::FM_ID_REPAIR_LIST),
+            ("fmIdRepairListNote", super::FM_ID_REPAIR_LIST_NOTE),
             ("fmRenameInput", super::FM_RENAME_INPUT),
             ("fmRenameSubmit", super::FM_RENAME_SUBMIT),
             ("fmDeleteConfirmInput", super::FM_DELETE_CONFIRM_INPUT),

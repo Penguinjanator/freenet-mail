@@ -49,8 +49,12 @@ files and the procedure for adding a generation.
 
 `delegates/mail-delegate` holds every identity's private keys, the contacts
 and the local mail state (drafts, sent, kept, archived, flags, settings). It
-signs and decrypts on the UI's behalf; keys leave it only through an export
-the user approves. The UI and the delegate speak the CBOR protocol in
+signs and decrypts on the UI's behalf. Keys leave it only through an export
+the user approves, with one exception: `CreateIdentity` returns the new
+identity's recovery key once, in its reply, so it can be backed up as it is
+made (the page asked for that identity, so no stored key is exposed). If
+that reply is lost, the UI finds the identity and asks for the key through
+the consented export. The UI and the delegate speak the CBOR protocol in
 `protocol/` (`freenet-mail-protocol`), which also holds the `fmail-key-1:`
 recovery-key codec. Its encoding is pinned per variant in
 `protocol/src/golden_v1.txt` (append-only).
@@ -63,7 +67,10 @@ recovery-key codec. Its encoding is pinned per variant in
   and listing, caps and exports read those.
 - **Budgets:** every key an origin writes goes through `store::Space`, which
   enforces a per-origin key and byte budget, so one app cannot exhaust
-  storage for another.
+  storage for another. The usage record is not exact (it runs high when a
+  counted write is refused, and can be lost), so a write that finds it
+  unknown, or that it would refuse, first recounts what is stored, in pages
+  of `RECOUNT_STEP` keys: a drifted record never blocks an origin for good.
 - **Compare-and-swap:** every record, index records included, carries a
   generation that is checked on write. Generations come from a per-origin
   counter and are never reused.
@@ -80,7 +87,8 @@ Its WASM lives under `published-contract/candidate/` until a release
 freezes it into `published-contract/wasm/v2/`.
 `scripts/check-delegate-candidate.sh` (CI `check-drift`) fails unless the
 committed bytes are exactly what the source builds. Rebuild it after
-changing the delegate, `protocol/` or `wire-v1/`
+changing the delegate, `protocol/` or `wire-v1/`, test-only edits
+included (they have been seen to change the bytes)
 (`published-contract/candidate/README.md`). `scripts/check-release-delegate.sh`,
 run by `release.sh`, refuses a release whose UI embeds the candidate or whose
 delegate was built with the `v1-transition` feature.
@@ -130,8 +138,10 @@ scripts/smoke-test-production.sh <url>   # Playwright suite against deployed web
 aliases of `derive-test-contract-id` and `verify-published-contract`. Nothing
 in the build or release flow writes to `published-contract/`.
 
-`example-data + use-node` is buildable but has no user — the app always
-reaches for the node when `use-node` is set. For offline dev builds use
+`example-data` (or `no-sync`) together with `use-node` does not compile:
+both turn on `local-delegate`, the in-page mail delegate that answers its
+own prompts, which must never be linked into a node build. For offline dev
+builds use
 `cargo make dev-example` (`--no-default-features --features
 example-data,no-sync`); see `ui/Cargo.toml` for the full feature list.
 
@@ -391,7 +401,10 @@ extended to every other on-chain contract:
 - `modules/antiflood-tokens/interfaces/` — shared aft-interface types
   crate (analog of facade-types). Path-dep'd by all three contracts.
 - `modules/identity-management/` and `modules/mail-local-state/` — the
-  two local delegates.
+  v0.2.x identity and local-state delegates. The UI no longer runs them
+  (the mail delegate replaced both); their frozen WASM and parameters stay
+  under `published-contract/wasm/v1/` because migrating their users' data
+  reads them.
 - `contracts/web-container/` — the webapp contract. It path-deps
   `common/`, so its lockfile follows `common/`'s versions; CI's
   `--locked` flags it when a root bump leaves it stale.
@@ -422,26 +435,28 @@ serialized shape there: `golden_v1.txt` holds bytes captured through the
 frozen crates, and `ui/src/frozen_keys_v1.txt` holds the delegate and
 contract keys the v0.2.x client derived, and tests fail if either drifts.
 The committed `identity-manager-params` and `mail-local-state-params`
-bytes are sent as-is (the delegate key hashes them). The
+bytes are kept as-is (the v0.2.x delegate keys hash them). The
 `getrandom_backend="custom"` cfg lives in `contracts/.cargo/` and
 `modules/.cargo/` (where those crates build), not at the root, because
 the UI's getrandom 0.4 needs its browser backend.
 
-**Inbox migration (#213/#223, shipped; #251 hardening)**: on UI
-startup the `set_aliases` callback in `ui/src/api.rs` compares the
-embedded `INBOX_CODE_HASH` against the `inbox_wasm_hash` recorded on
-each identity in the identity-management delegate. On drift it
-dispatches GETs for the old inbox keys (chained over every plausible
-historical hash — see below), and the GetResponse arm decodes the
-old state, re-signs via `Inbox::new`, and PUTs it under the current
-inbox key. Toast surfaces the migration to the user. On first
-observation (`inbox_wasm_hash = None`) the UI stamps the current
-hash as a baseline so the next bump is detectable. The schema bump
-on the delegate is backwards-compatible (`#[serde(default)]` on
-`AliasInfo.inbox_wasm_hash`).
+**Inbox migration (#213/#223, shipped; #251 hardening)**: each
+identity's migration markers (`identity_store::MigrationMarkers`) are
+stored in the mail delegate, in the identity's `IdentitySettings` item
+under `"migration"`. On UI startup `identity_store::prepare` reads them
+and `plan_load` compares the embedded `INBOX_CODE_HASH` against the
+recorded `inbox_wasm_hash`. On drift the node loop dispatches GETs for
+the old inbox keys (chained over every plausible historical hash — see
+below), and the GetResponse arm decodes the old state, re-signs it, and
+PUTs it under the current inbox key. Toast surfaces the migration to
+the user. On first observation (`inbox_wasm_hash = None`) the UI stamps
+the current hash as a baseline so the next bump is detectable. Markers
+that could not be read are unknown, never absent: nothing is planned
+and nothing is written back (writing defaults would wipe a pending
+marker).
 
 **AFT contract migration (#251 improvement 3)**: same shape applied
-to the AFT token-allocation-record contract. `AliasInfo` carries
+to the AFT token-allocation-record contract. `MigrationMarkers` carries
 `aft_record_wasm_hash` + `pending_aft_migration_from`;
 `LEGACY_TOKEN_RECORD_CODE_HASHES` in `ui/src/aft.rs` is the
 append-only oldest→newest list (parallel to
@@ -514,9 +529,9 @@ for OWN-identity derivations (own inbox is at the sender's embedded
 hash by construction).
 
 **Persistent migration retry (#251 improvement 5)**:
-`AliasInfo.pending_migration_from: Option<String>` is stamped on the
-identity-management delegate via `IdentityMsg::SetPendingMigrationFrom`
-BEFORE dispatching the migration GETs, and cleared (set to `None`)
+`MigrationMarkers.pending_migration_from: Option<String>` is written to
+the mail delegate (`identity_store::prepare`) BEFORE the node loop
+dispatches the migration GETs, and cleared (set to `None`)
 only when the PUT under the current inbox key succeeds. On startup
 `select_migrate_from` (in `ui/src/inbox.rs`) prefers a non-None
 pending marker over the recorded hash, so a session whose GET never
@@ -645,7 +660,7 @@ Two committed test keys live under `test-contract/`:
    ed25519, used to sign test webapps. Gives the test contract id, which
    `derive-test-contract-id` writes to `target/webapp/contract-id.txt`.
 2. **Identity delegate** (`test-contract/identity/identity-manager-key.*.pem`) —
-   P-384, used by the `identity-management` delegate. The shipped delegate
+   P-384, used by the v0.2.x `identity-management` delegate. The shipped delegate
    parameters derived from it are frozen as
    `published-contract/wasm/v1/identity-manager-params`.
 
@@ -754,8 +769,9 @@ to the gateway shell page's overlay HTML.
 
 Log assertions tail `~/freenet-mail-iso/gw/logs/freenet.*.log`
 (override via `FREENET_ISO_GW_LOG_DIR`) and grep for
-`UPDATE_PROPAGATION`, `allocate_token`, and identity-management
-markers. Day-1 AFT cap is dodged by wiping node data per run, so
+`UPDATE_PROPAGATION`, `allocate_token`, and the node compiling the mail
+delegate's code hash (proof the identity went through the delegate on
+the node). Day-1 AFT cap is dodged by wiping node data per run, so
 single-identity self-send works for the first send of the run.
 
 CI scope: this target is heavy (full freenet network + dx build

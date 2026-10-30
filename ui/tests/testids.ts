@@ -67,6 +67,7 @@ interface TestIds {
   fmRestoreAlias: string;
   fmRestoreExisting: string;
   fmBackupModal: string;
+  fmBackupWaiting: string;
   fmBackupPanel: string;
   fmBackupEntryTitle: string;
   fmBackupKey: string;
@@ -79,6 +80,7 @@ interface TestIds {
   fmBackupSavedNote: string;
   fmSettingsBackup: string;
   fmSettingsBackupBanner: string;
+  fmSettingsRevokeExport: string;
   fmIdRow: string;
   fmIdOpen: string;
   fmIdCreate: string;
@@ -87,6 +89,12 @@ interface TestIds {
   fmIdRename: string;
   fmIdShare: string;
   fmIdDelete: string;
+  fmIdUnfinishedDelete: string;
+  fmIdFinishDelete: string;
+  fmIdRepairStorage: string;
+  fmIdRepairStorageNote: string;
+  fmIdRepairList: string;
+  fmIdRepairListNote: string;
   fmRenameInput: string;
   fmRenameSubmit: string;
   fmDeleteConfirmInput: string;

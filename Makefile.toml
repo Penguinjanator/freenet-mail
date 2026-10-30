@@ -435,7 +435,7 @@ fdev --port "$PORT" publish \
 
 [tasks.publish-container]
 description = "Publish (PUT) the container contract to the live Freenet network — ONE-TIME prod publish only"
-dependencies = ["build-container", "sign-container-state"]
+dependencies = ["check-release-freeze", "build-container", "sign-container-state"]
 script_runner = "bash"
 script = '''
 set -euo pipefail
@@ -791,9 +791,16 @@ fdev --port "$PORT" publish \
     --webapp-metadata "$ROOT/target/webapp/webapp.metadata"
 '''
 
+[tasks.check-release-freeze]
+description = "Refuse while .release-freeze exists (first step of every production publish)"
+script_runner = "bash"
+script = '''
+"${CARGO_MAKE_WORKING_DIRECTORY}/scripts/check-release-freeze.sh"
+'''
+
 [tasks.publish-email]
 description = "Publish the production build of the webapp to Freenet"
-dependencies = ["sign-webapp", "verify-published-contract"]
+dependencies = ["check-release-freeze", "sign-webapp", "verify-published-contract"]
 script_runner = "bash"
 script = '''
 set -euo pipefail
@@ -818,6 +825,7 @@ dependencies = [
 [tasks.publish-production]
 description = "End-to-end PRODUCTION publish: build → sign with prod key → verify the committed snapshot → publish-email"
 dependencies = [
+    "check-release-freeze",
     "build",
     "publish-email",
 ]
@@ -851,12 +859,17 @@ RUST_BACKTRACE=1 RUST_LOG=freenet=debug,freenet_core=debug,info \
 
 [tasks.test]
 description = "Run all tests: the workspace, then every out-of-workspace crate"
-dependencies = ["test-workspace", "test-excluded"]
+dependencies = ["test-workspace", "test-ui-offline", "test-excluded"]
 
 [tasks.test-workspace]
 description = "Run the workspace's tests"
 command = "cargo"
 args = ["test", "--workspace"]
+
+[tasks.test-ui-offline]
+description = "Run the UI's tests in the offline build, which runs the real mail delegate in the page"
+command = "cargo"
+args = ["test", "-p", "freenet-email-ui", "--lib", "--no-default-features", "--features", "example-data,no-sync"]
 
 [tasks.test-excluded]
 description = "Run the tests of every crate outside the workspace (own Cargo.lock each)"
@@ -1024,10 +1037,15 @@ CONTRACT_ID="$(cat "$ROOT/target/webapp/contract-id.txt")"
 BASE_URL="http://127.0.0.1:$GW_PORT/v1/contract/web/$CONTRACT_ID/"
 echo "running live-node spec against $BASE_URL"
 
+# E2E_PLAYWRIGHT_ARGS passes extra Playwright options through, split on
+# whitespace (no quoting), e.g.
+#   E2E_PLAYWRIGHT_ARGS='--repeat-each=5 --grep=closes.is.saved'
+# to show a live test is deterministic before relying on it.
+read -r -a extra_args <<< "${E2E_PLAYWRIGHT_ARGS:-}"
 cd "$ROOT/ui/tests" && \
     FREENET_EMAIL_BASE_URL="$BASE_URL" \
     FREENET_ISO_GW_PORT="$GW_PORT" \
     FREENET_ISO_GW_LOG_DIR="$ISO_ROOT/gw/logs" \
     FREENET_ISO_PEER_LOG_DIR="$ISO_ROOT/peer/logs" \
-    npx playwright test live-node.spec.ts --project=chromium
+    npx playwright test live-node.spec.ts --project=chromium ${extra_args[@]+"${extra_args[@]}"}
 '''

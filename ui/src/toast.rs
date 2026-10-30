@@ -117,7 +117,64 @@ pub(crate) type ToastQueue = Signal<Vec<Toast>>;
 /// Returns the [`ToastId`] assigned to the new toast; callers that want to
 /// dismiss it early can pass the id to [`dismiss_toast`].
 pub(crate) fn push_toast(message: impl Into<String>, level: ToastLevel) -> ToastId {
-    push_toast_to(use_context::<ToastQueue>(), message, level)
+    // Outside a component scope (a detached task) there is no context to
+    // read, and reading it panicked the task, silently losing the toast.
+    // Such a caller should use `push_toast_detached`; this falls back to
+    // the root queue and says so.
+    let in_scope =
+        in_component(dioxus::core::Runtime::try_current().and_then(|rt| rt.try_current_scope_id()));
+    if in_scope && let Some(queue) = dioxus::core::try_consume_context::<ToastQueue>() {
+        return push_toast_to(queue, message, level);
+    }
+    let message = message.into();
+    crate::log::error(
+        format!("push_toast called outside a component; using the root queue: {message}"),
+        None,
+    );
+    debug_assert!(
+        !in_scope,
+        "push_toast in a scope with no toast queue: {message}"
+    );
+    push_toast_detached(message, level).unwrap_or_else(ToastId::next)
+}
+
+/// Whether code running in `scope` is inside the app's component tree,
+/// where the app's context (the toast queue) is visible. Dioxus wraps the
+/// app in its own root, suspense and error-boundary scopes; `spawn_forever`
+/// runs tasks in that root (`ScopeId::ROOT`), which sits above the app and
+/// cannot see its context, so it counts as outside, like no scope at all.
+fn in_component(scope: Option<dioxus::core::ScopeId>) -> bool {
+    use dioxus::core::ScopeId;
+    scope.is_some_and(|id| {
+        ![
+            ScopeId::ROOT,
+            ScopeId::ROOT_SUSPENSE_BOUNDARY,
+            ScopeId::ROOT_ERROR_BOUNDARY,
+        ]
+        .contains(&id)
+    })
+}
+
+thread_local! {
+    /// The app root's queue, for tasks that run outside the component tree.
+    static ROOT_QUEUE: std::cell::Cell<Option<ToastQueue>> = const { std::cell::Cell::new(None) };
+}
+
+/// Remember the app root's queue (set where the root provides it).
+pub(crate) fn set_root_queue(queue: ToastQueue) {
+    ROOT_QUEUE.with(|q| q.set(Some(queue)));
+}
+
+/// [`push_toast`] from a detached task (`spawn_forever`, the node loop),
+/// where `use_context` cannot find the queue: pushes onto the app root's
+/// queue. `None` before the root has rendered.
+pub(crate) fn push_toast_detached(
+    message: impl Into<String>,
+    level: ToastLevel,
+) -> Option<ToastId> {
+    ROOT_QUEUE
+        .with(|q| q.get())
+        .map(|queue| push_toast_to(queue, message, level))
 }
 
 /// [`push_toast`] onto a queue captured earlier. For code that runs outside
@@ -174,6 +231,34 @@ pub(crate) fn push_sticky_toast_to(
         level,
     });
     id
+}
+
+/// [`push_sticky_toast_to`] from a detached task, onto the app root's queue
+/// (see [`push_toast_detached`]). `None` before the root has rendered.
+pub(crate) fn push_sticky_toast_detached(
+    message: impl Into<String>,
+    level: ToastLevel,
+) -> Option<ToastId> {
+    ROOT_QUEUE
+        .with(|q| q.get())
+        .map(|queue| push_sticky_toast_to(queue, message, level))
+}
+
+/// Change the text of a toast still on screen, from a detached task. A toast
+/// the user already dismissed stays dismissed.
+pub(crate) fn update_toast_detached(id: ToastId, message: impl Into<String>) {
+    if let Some(mut queue) = ROOT_QUEUE.with(|q| q.get())
+        && let Some(toast) = queue.write().iter_mut().find(|t| t.id == id)
+    {
+        toast.message = message.into();
+    }
+}
+
+/// [`dismiss_toast`] from a detached task, on the app root's queue.
+pub(crate) fn dismiss_toast_detached(id: ToastId) {
+    if let Some(queue) = ROOT_QUEUE.with(|q| q.get()) {
+        dismiss_toast_in(queue, id);
+    }
 }
 
 /// Remove a toast by id. Silently no-ops if the id is no longer in the queue
@@ -237,8 +322,34 @@ pub(crate) fn ToastView() -> Element {
 // ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod scope_tests {
+    use super::in_component;
+    use dioxus::core::ScopeId;
+
+    /// A `spawn_forever` task runs in Dioxus's root scope, above the app,
+    /// where the toast queue is not visible: that must count as outside the
+    /// component tree, or the `debug_assert` in `push_toast` fires.
+    #[test]
+    fn the_root_scopes_spawn_forever_uses_are_outside_the_app() {
+        assert!(!in_component(None));
+        assert!(!in_component(Some(ScopeId::ROOT)));
+        assert!(!in_component(Some(ScopeId::ROOT_SUSPENSE_BOUNDARY)));
+        assert!(!in_component(Some(ScopeId::ROOT_ERROR_BOUNDARY)));
+        assert!(in_component(Some(ScopeId::APP)));
+        assert!(in_component(Some(ScopeId(ScopeId::APP.0 + 5))));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn push_toast_outside_a_component_does_not_panic() {
+        // No Dioxus runtime at all here, as in a detached task with no
+        // scope: `use_context` panicked in this situation.
+        let _ = push_toast("from a detached task", ToastLevel::Error);
+    }
 
     #[test]
     fn toast_id_is_monotonically_increasing() {

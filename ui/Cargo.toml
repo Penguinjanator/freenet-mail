@@ -34,6 +34,14 @@ gloo-timers = { version = "0.4.0", features = ["futures"] }
 
 freenet-mail-wire-v1 = { workspace = true, features = ["clock"] }
 freenet-mail-protocol = { workspace = true }
+# The real mail delegate, run in-page for the offline build (no node). Never
+# linked into a `use-node` build: the node runs the published WASM. Built
+# with `v1-transition`, as the candidate the node build embeds is, so the
+# offline build answers `V1AftParams` the same way.
+mail-delegate = { path = "../delegates/mail-delegate", optional = true, features = ["v1-transition"] }
+serde_bytes = "0.11.19"
+ciborium = "0.2.2"
+zeroize = "1.8.2"
 freenet-stdlib = { workspace = true, features = ["net"] }
 uuid = { version = "1.29.0", features = ["v4", "js"] }
 
@@ -44,12 +52,14 @@ serde-wasm-bindgen = "0.6.5"
 [target.'cfg(target_family = "wasm")'.dependencies.web-sys]
 version = "0.3.106"
 features = [
+    "BeforeUnloadEvent",
     "BinaryType",
     "Blob",
     "BlobPropertyBag",
     "Clipboard",
     "console",
     "Document",
+    "Element",
     "ErrorEvent",
     "File",
     "FileList",
@@ -75,11 +85,13 @@ default = ["use-node"]
 # Seed the UI with mock identities and mock messages so it renders without
 # any real Freenet state. Combine with `no-sync` for a fully offline build:
 #   cargo make dev-example
-example-data = []
+example-data = ["local-delegate"]
 # Skip the local-node WebSocket entirely. Orthogonal to `example-data` —
 # enabling `no-sync` alone produces an empty UI; pair with `example-data`
 # (and `--no-default-features`) for the offline dev loop.
-no-sync = []
+no-sync = ["local-delegate"]
+# Run the mail delegate in the page instead of on a node (offline builds).
+local-delegate = ["dep:mail-delegate"]
 use-node = []
 
 [build-dependencies]

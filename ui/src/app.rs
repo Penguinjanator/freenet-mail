@@ -1,7 +1,6 @@
 #[cfg(feature = "example-data")]
 use std::collections::HashMap;
 use std::fmt::Display;
-use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::{borrow::Cow, cell::RefCell, rc::Rc};
 
@@ -10,8 +9,8 @@ use dioxus::prelude::*;
 use freenet_stdlib::prelude::ContractKey;
 use futures::FutureExt;
 use futures::future::LocalBoxFuture;
-use ml_dsa::{MlDsa65, SigningKey as MlDsaSigningKey};
-use ml_kem::{DecapsulationKey, EncapsulationKey, MlKem768};
+use ml_dsa::MlDsa65;
+use ml_kem::{EncapsulationKey, MlKem768};
 use wasm_bindgen::JsValue;
 
 pub(crate) use login::{Identity, LoginController};
@@ -27,6 +26,11 @@ use crate::{
 pub(crate) mod address_book;
 pub(crate) mod backup_panel;
 pub(crate) mod backup_token;
+// Offline builds keep contacts in memory only; they still compile this so
+// its tests run against the in-page delegate.
+#[cfg_attr(not(feature = "use-node"), allow(dead_code))]
+pub(crate) mod contact_store;
+pub(crate) mod identity_store;
 pub(crate) mod login;
 pub(crate) mod settings;
 
@@ -40,39 +44,40 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
+thread_local! {
+    /// The branch `app()` rendered last, so a change can be logged.
+    static LAST_BODY: std::cell::Cell<&'static str> = const { std::cell::Cell::new("none") };
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum NodeAction {
     LoadMessages(Box<Identity>),
+    /// The identities the mail delegate holds, read at startup in a task
+    /// (`identity_store::load_and_report`): restore their inboxes, AFT
+    /// records and token-generator delegates, and run the contract
+    /// migrations.
+    IdentitiesLoaded {
+        identities: Vec<identity_store::LoadedIdentity>,
+    },
+    /// Surface an identity the mail delegate just created or restored. Its
+    /// keys are already in the delegate; the contracts are published by the
+    /// `CreateContract` / `CreateDelegate` actions sent with it
+    /// (`identity_store::publish`).
     CreateIdentity {
-        alias: Rc<str>,
-        ml_dsa_key: Arc<MlDsaSigningKey<MlDsa65>>,
-        ml_kem_dk: Box<DecapsulationKey<MlKem768>>,
-        description: String,
-        /// Whether a backup of THESE keys is known to exist (the user
-        /// confirmed "I've saved it" while creating, or restored from a
-        /// recovery key / backup file). Recorded only after the create
-        /// request has been sent to the node without error; see
+        identity: Box<Identity>,
+        /// Whether a backup of this identity's keys is known to exist (the
+        /// user confirmed "I've saved it" while creating, or restored from a
+        /// recovery key / backup file); see
         /// `login::record_backup_after_create`.
         backed_up: bool,
     },
     CreateContract {
         alias: Rc<str>,
         contract_type: ContractType,
-        /// ML-DSA-65 signing key used for both inbox ownership and AFT
-        /// token signing (same key serves both subsystems post-Stage-4).
-        ml_dsa_key: Arc<MlDsaSigningKey<MlDsa65>>,
-        /// ML-KEM-768 encapsulation key bytes for the inbox owner. Stamped
-        /// into the inbox state's `owner_ek_bytes` field so senders can
-        /// recover the recipient's encryption key by Get-ing the inbox.
-        /// Ignored for `ContractType::AFTContract`.
-        ml_kem_ek_bytes: Vec<u8>,
-        /// Initial recipient anti-flood policy seeded into the inbox's
-        /// `InboxSettings` at creation. Only consulted for
-        /// `ContractType::InboxContract`; the AFT record contract id is
-        /// derived from the sender's key alone. Owner can mutate later
-        /// via `UpdateInboxPolicy` (#85).
-        required_tier: freenet_mail_wire_v1::aft::Tier,
-        max_age_secs: u64,
+        identity: Box<Identity>,
+        /// The signed initial inbox state (the delegate signs it). Empty for
+        /// `ContractType::AFTContract`, whose record starts empty.
+        inbox_state: Vec<u8>,
     },
     /// Push a signed `ModifySettings` delta updating the recipient
     /// anti-flood policy on the inbox contract owned by `identity`
@@ -95,8 +100,10 @@ pub(crate) enum NodeAction {
     },
     CreateDelegate {
         alias: Rc<str>,
-        /// ML-DSA-65 signing key used by the AFT token-generator delegate.
-        ml_dsa_key: Arc<MlDsaSigningKey<MlDsa65>>,
+        identity: Box<Identity>,
+        /// The v1 token-generator delegate's parameters, from the mail
+        /// delegate (`V1AftParams`). They carry the signing seed.
+        aft_params: crate::mail_delegate::ops::SecretBytes,
     },
     /// Store a new contact in the identity-management delegate.
     CreateContact {
@@ -173,6 +180,7 @@ pub(crate) fn app() -> Element {
     // toasts without an extra Signal thread-local.
     use_context_provider(|| crate::toast::ToastQueue::new(Vec::new()));
     let toast = use_context::<crate::toast::ToastQueue>();
+    crate::toast::set_root_queue(toast);
     // Modal signals lifted to the root so that both the login pane
     // (IdentifiersList) and the inbox (UserInbox → Settings → Contacts)
     // can open these modals. Fixes #158.
@@ -190,7 +198,7 @@ pub(crate) fn app() -> Element {
     #[cfg(all(feature = "use-node", not(feature = "no-sync")))]
     {
         let _ = toast;
-        let _sync: Coroutine<NodeAction> = use_coroutine(move |rx| {
+        let sync: Coroutine<NodeAction> = use_coroutine(move |rx| {
             let login_controller = login_controller;
             let user = user;
             let fut = crate::api::node_comms(rx, login_controller, user, inbox_data, ab_gen)
@@ -198,6 +206,7 @@ pub(crate) fn app() -> Element {
             let _ = wasm_bindgen_futures::future_to_promise(fut);
             async {}.boxed_local()
         });
+        identity_store::set_action_sender(sync);
     }
     #[cfg(any(not(feature = "use-node"), feature = "no-sync"))]
     {
@@ -206,7 +215,7 @@ pub(crate) fn app() -> Element {
         let mut login_ctl = login_controller;
         let mut ab_gen = ab_gen;
         let mut user_sig = user;
-        let _sync: Coroutine<NodeAction> =
+        let sync: Coroutine<NodeAction> =
             use_coroutine(move |mut rx: UnboundedReceiver<NodeAction>| async move {
                 use futures::StreamExt;
                 while let Some(action) = rx.next().await {
@@ -237,53 +246,68 @@ pub(crate) fn app() -> Element {
                         // way the example-data seeding does, so the create
                         // and restore flows end in a usable identity (and
                         // are testable in Playwright) without a node.
+                        // The in-page delegate already holds the identity.
                         #[cfg(feature = "example-data")]
                         NodeAction::CreateIdentity {
-                            alias,
-                            ml_dsa_key,
-                            ml_kem_dk,
-                            description,
+                            identity,
                             backed_up,
                         } => {
-                            if Identity::get_alias(&alias).is_none() {
-                                // UserId must equal the slot index
-                                // (`User::set_logged_id` indexes by it).
-                                let id = UserId(user_sig.read().identities.len());
-                                let identity = Identity::new(
-                                    alias.clone(),
-                                    id,
-                                    description,
-                                    ml_dsa_key,
-                                    *ml_kem_dk,
-                                );
+                            if Identity::get_alias(&identity.alias).is_none() {
+                                let mut identity = *identity;
+                                identity.id = UserId::new();
+                                let alias = identity.alias.clone();
                                 Identity::register_example(identity.clone());
                                 user_sig.write().identities.push(identity);
                                 login::record_backup_after_create(&alias, backed_up);
                                 login_ctl.write().updated = true;
                             }
                         }
-                        NodeAction::RenameIdentity { old, new, .. } => {
-                            // Offline mode: just relabel the in-memory
-                            // ALIASES entries. The delegate isn't
-                            // around, so there's no delete+create round
-                            // trip.
-                            Identity::rename_in_place(&old, &new);
-                            login_ctl.write().updated = true;
+                        NodeAction::RenameIdentity { old, new, identity } => {
+                            // The in-page delegate holds the identity, as a
+                            // node's would: rename it there, then relabel.
+                            let outcome =
+                                identity_store::rename_identity(&identity, &old, &new, user_sig)
+                                    .await;
+                            match identity_store::rename_failure_text(&old, &outcome) {
+                                None => login_ctl.write().updated = true,
+                                Some(text) => {
+                                    crate::toast::push_toast_detached(
+                                        text,
+                                        crate::toast::ToastLevel::Error,
+                                    );
+                                }
+                            }
                         }
                         NodeAction::DeleteIdentity { identity } => {
-                            Identity::remove_in_place(&identity.alias);
-                            let mut user_w = user_sig.write();
-                            let was_logged_in = user_w
-                                .logged_id()
-                                .map(|i| i.id == identity.id)
-                                .unwrap_or(false);
-                            user_w.identities.retain(|i| i.id != identity.id);
-                            if was_logged_in {
-                                user_w.logout();
+                            // The in-page delegate holds the identity, as a
+                            // node's would: delete it there first, through
+                            // the same paged deletion the node build uses.
+                            if let Err(e) = identity_store::delete_with_progress(
+                                identity.addr,
+                                identity.generation,
+                                &identity.alias,
+                            )
+                            .await
+                            {
+                                crate::toast::push_toast_detached(
+                                    e,
+                                    crate::toast::ToastLevel::Error,
+                                );
+                                let unfinished =
+                                    identity_store::refresh_unfinished_deletions().await;
+                                if identity_store::settle_after_failed_deletion(
+                                    &identity,
+                                    unfinished.as_deref(),
+                                    &mut user_sig.write(),
+                                ) {
+                                    login_ctl.write().updated = true;
+                                    let prev = *ab_gen.0.read();
+                                    ab_gen.0.set(prev.wrapping_add(1));
+                                }
+                                continue;
                             }
-                            drop(user_w);
+                            identity_store::drop_from_page(&identity, &mut user_sig.write());
                             login_ctl.write().updated = true;
-                            address_book::remove_contact(&identity.alias);
                             let prev = *ab_gen.0.read();
                             ab_gen.0.set(prev.wrapping_add(1));
                         }
@@ -291,6 +315,7 @@ pub(crate) fn app() -> Element {
                     }
                 }
             });
+        identity_store::set_action_sender(sync);
     }
     #[allow(unused_variables)]
     let actions = use_coroutine_handle::<NodeAction>();
@@ -309,6 +334,27 @@ pub(crate) fn app() -> Element {
         };
     }
 
+    {
+        let u = user.read();
+        let branch = if !u.identified {
+            "login"
+        } else if u.logged_id().is_some() {
+            "inbox"
+        } else {
+            "identities"
+        };
+        LAST_BODY.with(|last| {
+            if last.get() != branch {
+                crate::log::info(format!(
+                    "app body: {} -> {branch} (active_id={:?}, identities={})",
+                    last.get(),
+                    u.active_id.map(|id| id.0),
+                    u.identities.len()
+                ));
+                last.set(branch);
+            }
+        });
+    }
     // Render login page if user not identified, otherwise render the inbox or identifiers list based on user's logged in state
     let body = if !user.read().identified {
         rsx! {
@@ -384,8 +430,11 @@ pub struct InboxView {
 pub(crate) struct UserId(usize);
 
 impl UserId {
+    /// A page-unique id. It is an identity's handle, never its position in
+    /// `User::identities` (identities are removed from the middle). Starts
+    /// above the fixed ids the example data seeds (0 and 1).
     pub fn new() -> Self {
-        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(16);
         Self(NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
     }
 }
@@ -416,6 +465,7 @@ impl InboxView {
         &mut self,
         client: WebApiRequestClient,
         from: &str,
+        from_addr: freenet_mail_protocol::Addr,
         recipient_ek: EncapsulationKey<MlKem768>,
         recipient_ml_dsa_vk: ml_dsa::VerifyingKey<MlDsa65>,
         recipient_required_tier: freenet_mail_wire_v1::aft::Tier,
@@ -454,13 +504,7 @@ impl InboxView {
             crate::log::debug!("sending message from {from}");
             let content_clone = content.clone();
             let mut client = client.clone();
-            let Some(id) = crate::inbox::InboxModel::id_for_alias(from) else {
-                crate::log::error(
-                    format!("alias `{from}` not stored"),
-                    Some(TryNodeAction::SendMessage),
-                );
-                return Ok(futs);
-            };
+            let id = crate::inbox::InboxModel::sender_identity(&from_addr, from)?;
             let ack_meta_async = ack_meta.clone();
             let recipient_hash_async = recipient_inbox_wasm_hash.clone();
             let f = async move {
@@ -494,18 +538,14 @@ impl InboxView {
                         &sender_alias,
                         &sent_id,
                         freenet_mail_wire_v1::local_state::DeliveryState::Failed,
-                    ) {
-                        let mut client_clone = client.clone();
-                        if let Err(e) = crate::local_state::set_sent_delivery_state(
-                            &mut client_clone,
-                            sender_alias,
-                            sent_id,
-                            freenet_mail_wire_v1::local_state::DeliveryState::Failed,
-                        )
-                        .await
-                        {
-                            crate::log::local_state_failure("update delivery state", e);
-                        }
+                    ) && let Err(e) = crate::local_state::set_sent_delivery_state(
+                        sender_alias,
+                        sent_id,
+                        freenet_mail_wire_v1::local_state::DeliveryState::Failed,
+                    )
+                    .await
+                    {
+                        crate::log::local_state_failure("update delivery state", e);
                     }
                 }
             };
@@ -552,12 +592,73 @@ impl InboxView {
         Ok(futs)
     }
 
+    /// The identity whose inbox this view shows now.
+    fn active_user(&self) -> UserId {
+        *self.active_id.borrow()
+    }
+
+    /// A removal of `ids` from the inbox shown NOW, to run later. The inbox
+    /// is resolved and bound here, by the identity that owns it (the way
+    /// `MessageList` finds the inbox it shows): an archive waits for its
+    /// write to be acknowledged before removing, and the user may switch
+    /// identity meanwhile. Inboxes are kept in the order their state
+    /// arrived, so a position in that list says nothing about whose inbox
+    /// it is.
+    fn defer_removal(&self, ids: &[u64], inbox_data: InboxesData) -> DeferredRemoval {
+        self.defer_removal_in(ids, &inbox_data.snapshot(), inbox_owner)
+    }
+
+    /// [`Self::defer_removal`] over any list of inboxes and owner lookup.
+    fn defer_removal_in<T: Clone>(
+        &self,
+        ids: &[u64],
+        inboxes: &[T],
+        owner: impl Fn(&T) -> Option<UserId>,
+    ) -> DeferredRemoval<T> {
+        let target = self.active_user();
+        DeferredRemoval {
+            target,
+            inbox: pick_inbox(inboxes, target, owner),
+            ids: ids.to_vec(),
+        }
+    }
+
     fn remove_messages(
         &mut self,
         client: WebApiRequestClient,
         ids: &[u64],
         inbox_data: InboxesData,
     ) -> Result<LocalBoxFuture<'static, ()>, DynError> {
+        self.defer_removal(ids, inbox_data).run(client)
+    }
+}
+
+/// The identity that owns `inbox`, as the inbox routing records it.
+fn inbox_owner(inbox: &Rc<RefCell<InboxModel>>) -> Option<UserId> {
+    crate::inbox::InboxModel::contract_identity(&inbox.borrow().key).map(|id| id.id)
+}
+
+/// The inbox in `inboxes` that `target` owns, found by owner, never by
+/// position. `None` if that identity's inbox is not loaded.
+fn pick_inbox<T: Clone>(
+    inboxes: &[T],
+    target: UserId,
+    owner: impl Fn(&T) -> Option<UserId>,
+) -> Option<T> {
+    inboxes.iter().find(|ib| owner(ib) == Some(target)).cloned()
+}
+
+/// See [`InboxView::defer_removal`].
+struct DeferredRemoval<T = Rc<RefCell<InboxModel>>> {
+    target: UserId,
+    /// The inbox bound when the removal was deferred.
+    inbox: Option<T>,
+    ids: Vec<u64>,
+}
+
+impl DeferredRemoval {
+    fn run(self, client: WebApiRequestClient) -> Result<LocalBoxFuture<'static, ()>, DynError> {
+        let ids = &self.ids[..];
         tracing::debug!("removing messages: {ids:?}");
         // In offline mode the real `InboxesData` store is never populated,
         // so skip the contract-state mutation and just return a no-op.
@@ -565,18 +666,22 @@ impl InboxView {
         {
             let _ = client;
             let _ = ids;
-            let _ = inbox_data;
             Ok(async {}.boxed_local())
         }
         #[cfg(not(all(feature = "example-data", not(feature = "use-node"))))]
         {
-            // FIXME: indexing by id fails cause all not aliases inboxes has been loaded initially
-            let inbox_data = inbox_data.snapshot();
-            let mut inbox = inbox_data[**self.active_id.borrow()].borrow_mut();
+            // Not every identity's inbox may be loaded yet; that is an
+            // error to report, not a panic.
+            let inbox = self
+                .inbox
+                .ok_or_else(|| format!("the inbox for identity {} is not loaded", *self.target))?;
+            let mut inbox = inbox.borrow_mut();
             inbox.remove_messages(client, ids)
         }
     }
+}
 
+impl InboxView {
     /// Mark messages as read in the in-memory view. Read-state persistence
     /// to the mail-local-state delegate is the caller's responsibility (see
     /// `OpenMessage`). Crucially this does NOT evict the message from the
@@ -852,33 +957,30 @@ pub(crate) struct User {
 impl User {
     #[cfg(feature = "example-data")]
     fn new() -> Self {
-        let ml_dsa0 = Arc::new(ml_dsa::SigningKey::<MlDsa65>::from_seed(
-            &crate::rng::random_bytes::<32>().into(),
-        ));
-        let ml_dsa1 = Arc::new(ml_dsa::SigningKey::<MlDsa65>::from_seed(
-            &crate::rng::random_bytes::<32>().into(),
-        ));
-        let ml_kem_dk0 =
-            DecapsulationKey::<MlKem768>::from_seed(crate::rng::random_bytes::<64>().into());
-        let ml_kem_dk1 =
-            DecapsulationKey::<MlKem768>::from_seed(crate::rng::random_bytes::<64>().into());
-
-        let identities = vec![
-            Identity::new(
-                "address1".into(),
-                UserId(0),
-                "Mock identity (example-data)".into(),
-                ml_dsa0,
-                ml_kem_dk0,
-            ),
-            Identity::new(
-                "address2".into(),
-                UserId(1),
-                "Mock identity (example-data)".into(),
-                ml_dsa1,
-                ml_kem_dk1,
-            ),
-        ];
+        // The in-page delegate holds the example identities' keys, as a
+        // node's would. It answers synchronously, so this needs no executor
+        // beyond polling once. It outlives a `User`: the storybook host builds
+        // a second one, so reuse an identity the delegate already holds
+        // rather than creating it again (which it refuses as a conflict).
+        let create = |alias: &str, id: usize| {
+            let held = futures::executor::block_on(crate::mail_delegate::ops::list_identities())
+                .expect("the in-page delegate lists identities")
+                .into_iter()
+                .find(|info| info.alias == alias);
+            let info = match held {
+                Some(info) => info,
+                None => {
+                    futures::executor::block_on(crate::mail_delegate::ops::create_identity(
+                        alias.into(),
+                        "Mock identity (example-data)".into(),
+                    ))
+                    .expect("the in-page delegate creates the example identities")
+                    .0
+                }
+            };
+            Identity::from_info(&info, UserId(id))
+        };
+        let identities = vec![create("address1", 0), create("address2", 1)];
         // Register with the shared ALIASES store so IdentifiersList
         // (which reads from ALIASES, not User.identities) sees them.
         for id in &identities {
@@ -918,13 +1020,17 @@ impl User {
         }
     }
 
+    /// The active identity, looked up by its id (never by position: removing
+    /// an identity shifts the ones after it).
     pub(crate) fn logged_id(&self) -> Option<&Identity> {
-        self.active_id.and_then(|id| self.identities.get(id.0))
+        self.active_id
+            .and_then(|id| self.identities.iter().find(|i| i.id == id))
     }
 
+    /// Select `id`. An id no identity on the page carries (one removed
+    /// meanwhile) selects nothing rather than another identity.
     pub(crate) fn set_logged_id(&mut self, id: UserId) {
-        assert!(id.0 < self.identities.len());
-        self.active_id = Some(id);
+        self.active_id = self.identities.iter().any(|i| i.id == id).then_some(id);
     }
 
     /// Clear the active-identity selection without logging out the user
@@ -1082,6 +1188,56 @@ pub(crate) struct ComposePostSend {
     /// True only on success: push the green "Sent" toast. The `Err` arm
     /// of `send_message` pushes its own contextual error toast.
     pub push_success_toast: bool,
+}
+
+/// One send at a time per compose sheet. Send first checks the draft with
+/// the delegate (a round trip), so a second click arriving before that
+/// answer would start a second send of the same message. The first click
+/// claims the send; later clicks are ignored until it settles
+/// ([`release_send`]).
+pub(crate) fn claim_send(sending: &mut bool) -> bool {
+    if *sending {
+        return false;
+    }
+    *sending = true;
+    true
+}
+
+/// The send claimed by [`claim_send`] has settled (sent, refused or
+/// failed), so Send works again.
+pub(crate) fn release_send(sending: &mut bool) {
+    *sending = false;
+}
+
+/// What the user sees when closing the compose sheet cancelled a send that
+/// was still being checked.
+#[cfg_attr(not(feature = "use-node"), allow(dead_code))]
+const SEND_CANCELLED_BY_CLOSE: &str = "The message was not sent: the compose window closed before it went. Your draft is saved; open it and send again.";
+
+/// Runs its action if dropped before [`OnCancel::disarm`]: for a task that
+/// the page can drop midway (a component unmounting), so being cut off is
+/// reported instead of passing silently.
+#[cfg_attr(not(feature = "use-node"), allow(dead_code))]
+pub(crate) struct OnCancel<F: FnOnce()>(Option<F>);
+
+#[cfg_attr(not(feature = "use-node"), allow(dead_code))]
+impl<F: FnOnce()> OnCancel<F> {
+    pub(crate) fn new(action: F) -> Self {
+        Self(Some(action))
+    }
+
+    /// The task got past the point where dropping it mattered.
+    pub(crate) fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl<F: FnOnce()> Drop for OnCancel<F> {
+    fn drop(&mut self) {
+        if let Some(action) = self.0.take() {
+            action();
+        }
+    }
 }
 
 /// All-or-nothing decision driven by `send_succeeded`. Encodes the
@@ -1453,8 +1609,9 @@ pub(crate) mod threads {
             (Some(am), Some(bm)) => super::sort_cmp_inbox(am, bm),
             _ => std::cmp::Ordering::Equal,
         };
-        // Total tie-break: newest root_id first. `root_id` is unique per group
+        // Total tie-break: largest root_id first. `root_id` is unique per group
         // (it's the oldest member's message id), so this can never itself tie.
+        // Ids are content hashes, so this is only a fixed order, not a time.
         primary.then_with(|| b.root_id.cmp(&a.root_id))
     }
 
@@ -1964,6 +2121,28 @@ mod thread_grouping_tests {
         // oldest→newest by time then id
         let order: Vec<u64> = g.messages.iter().map(|x| x.id).collect();
         assert_eq!(order, vec![0, 1, 2]);
+    }
+
+    /// Message ids are content hashes and carry no time (#289), so a thread
+    /// is ordered by time alone: here the ids run newest→oldest, and the
+    /// order, the root and "the newest" must still follow the clock.
+    #[test]
+    fn a_thread_is_ordered_by_time_never_by_id() {
+        let msgs = vec![
+            m(u64::MAX >> 2, "mary", "Lunch?", 0, true, Some("t1"), None),
+            m(5, "me", "Re: Lunch?", 10, true, Some("t1"), None),
+            m(1, "mary", "Re: Lunch?", 20, false, Some("t1"), None),
+        ];
+        let groups = group_into_threads(&msgs);
+        let g = group_with_key(&groups, "t1");
+        let order: Vec<u64> = g.messages.iter().map(|x| x.id).collect();
+        assert_eq!(order, vec![u64::MAX >> 2, 5, 1], "oldest→newest by time");
+        assert_eq!(g.root_id, u64::MAX >> 2, "the root is the oldest message");
+        assert_eq!(
+            g.messages.last().map(|x| x.id),
+            Some(1),
+            "the newest is the latest sent"
+        );
     }
 
     /// (b) Legacy messages (no thread_id) group via the heuristic key by
@@ -2953,9 +3132,11 @@ fn folded_sent_rows(received: &[Message], alias: &str, search: &str) -> Vec<Mess
         .collect()
 }
 
-/// Offset for synthetic folded-sent `Message.id`s (#310). Far above any real
-/// inbox enumerate index so a folded row can never shadow a received one.
-const SENT_FOLD_ID_BASE: u64 = 1 << 48;
+/// Offset for synthetic folded-sent `Message.id`s (#310): the half of the id
+/// space received messages never use (`local_state::RECEIVED_ID_LIMIT`), so a
+/// folded row can never shadow a received one, nor a received one pass for a
+/// folded row (#289).
+const SENT_FOLD_ID_BASE: u64 = crate::local_state::RECEIVED_ID_LIMIT;
 
 /// Convert a `SentMessage` into an `is-me` `Message` row for thread folding
 /// (#310). `from = alias` lights up `.is-me` styling; `read = true` (own mail
@@ -2972,7 +3153,7 @@ fn sent_message_to_row(
         hash ^= u64::from(*b);
         hash = hash.wrapping_mul(1099511628211);
     }
-    let synthetic_id = SENT_FOLD_ID_BASE | (hash & ((1 << 48) - 1));
+    let synthetic_id = SENT_FOLD_ID_BASE | (hash & (SENT_FOLD_ID_BASE - 1));
     let time = chrono::DateTime::from_timestamp_millis(s.sent_at).unwrap_or_else(Utc::now);
     Message {
         id: synthetic_id,
@@ -3003,6 +3184,8 @@ fn matches_search(m: &Message, q: &str) -> bool {
 #[allow(non_snake_case)]
 fn UserInbox() -> Element {
     use_context_provider(|| Signal::new(menu::MenuSelection::default()));
+    use_hook(|| crate::log::info("inbox view: mounted"));
+    use_drop(|| crate::log::info("inbox view: unmounted"));
     // ImportBackup / ImportContact / ShareContact / SharePending are all
     // provided by app() at the root (lifted in #158 fix) so that the modals
     // are reachable from both the login pane and the inbox view.
@@ -3267,9 +3450,11 @@ fn Sidebar() -> Element {
                             let testid = format!("fm-folder-{}", f.label().to_lowercase());
                             rsx! {
                                 button {
+                                    key: "{testid}",
                                     class: "{cls}",
                                     "data-testid": "{testid}",
                                     onclick: move |_| {
+                                        crate::log::info(format!("folder: clicked {}", f.label()));
                                         menu_selection.write().set_folder(f);
                                         drawer_open.set(false);
                                     },
@@ -4012,28 +4197,7 @@ fn ThreadDetail(group: crate::app::threads::ThreadGroup) -> Element {
                 };
                 crate::local_state::local_mark_read(&alias, m.id, kept.clone());
                 #[cfg(feature = "use-node")]
-                {
-                    let mut client_clone = client.clone();
-                    let alias_for_send = alias.clone();
-                    let mid = m.id;
-                    // spawn_forever: opening a message then immediately
-                    // navigating away (archive/delete/back) unmounts this
-                    // view; a bare spawn() would cancel the MarkRead delegate
-                    // write, so the message resurfaced as unread on reload
-                    // (#286 read-state variant).
-                    let _task = dioxus_core::spawn_forever(async move {
-                        if let Err(e) = crate::local_state::mark_read(
-                            &mut client_clone,
-                            alias_for_send,
-                            mid,
-                            kept,
-                        )
-                        .await
-                        {
-                            crate::log::local_state_failure("mark thread message read", e);
-                        }
-                    });
-                }
+                crate::local_state::persist_read(&alias, m.id, kept, "mark thread message read");
             }
         }
     }
@@ -4474,7 +4638,6 @@ fn OpenArchivedMessage(
 ) -> Element {
     let mut menu_selection = use_context::<Signal<menu::MenuSelection>>();
     let user = use_context::<Signal<User>>();
-    let client = crate::api::WEB_API_SENDER.get().unwrap();
 
     let from = msg.from.clone();
     let from_initial = from.chars().next().unwrap_or('·').to_string();
@@ -4557,7 +4720,6 @@ fn OpenArchivedMessage(
                             crate::local_state::local_delete_message(&delete_alias, msg_id);
                             #[cfg(feature = "use-node")]
                             {
-                                let mut c = client.clone();
                                 let a = delete_alias.clone();
                                 // spawn_forever: at_inbox_list() below
                                 // navigates away and unmounts this view, which
@@ -4565,22 +4727,8 @@ fn OpenArchivedMessage(
                                 // DeleteMessage delegate write committed —
                                 // message returns after reload (#286).
                                 confirm_when_stored(
-                                    async move {
-                                        match crate::local_state::delete_message(
-                                            &mut c, a, msg_id,
-                                        )
-                                        .await
-                                        {
-                                            Ok(()) => true,
-                                            Err(e) => {
-                                                crate::log::error(
-                                                    format!("delete_message failed: {e}"),
-                                                    None,
-                                                );
-                                                false
-                                            }
-                                        }
-                                    },
+                                    "delete_message",
+                                    crate::local_state::delete_message(a, msg_id),
                                     &CONFIRM_DELETE,
                                 );
                             }
@@ -4618,8 +4766,6 @@ fn OpenSentMessage(
 ) -> Element {
     let mut menu_selection = use_context::<Signal<menu::MenuSelection>>();
     let user = use_context::<Signal<User>>();
-    #[cfg(feature = "use-node")]
-    let client = crate::api::WEB_API_SENDER.get().unwrap();
     let delete_alias = user
         .read()
         .logged_id()
@@ -4755,7 +4901,6 @@ fn OpenSentMessage(
                             crate::local_state::local_delete_sent(&delete_alias, &sent_id);
                             #[cfg(feature = "use-node")]
                             {
-                                let mut c = client.clone();
                                 let a = delete_alias.clone();
                                 let id = sent_id.clone();
                                 // spawn_forever: at_inbox_list() below unmounts
@@ -4763,19 +4908,8 @@ fn OpenSentMessage(
                                 // the DeleteSent delegate write committed, so the
                                 // row would return after reload (mirrors #286).
                                 confirm_when_stored(
-                                    async move {
-                                        match crate::local_state::delete_sent(&mut c, a, id).await
-                                        {
-                                            Ok(()) => true,
-                                            Err(e) => {
-                                                crate::log::error(
-                                                    format!("delete_sent failed: {e}"),
-                                                    None,
-                                                );
-                                                false
-                                            }
-                                        }
-                                    },
+                                    "delete_sent",
+                                    crate::local_state::delete_sent(a, id),
                                     &CONFIRM_DELETE,
                                 );
                             }
@@ -4885,25 +5019,35 @@ fn archive_message(
         crate::local_state::local_archive_message(alias, id, archived.clone());
         #[cfg(feature = "use-node")]
         {
-            let mut c = client.clone();
             let a = alias.to_string();
             let ar = archived.clone();
-            // spawn_forever: the caller runs post.apply() right after this,
-            // navigating away and unmounting the view. A bare spawn() would
-            // cancel the ArchiveMessage delegate write on unmount, so the
-            // archived message bounced back to the Inbox after reload (#286).
-            confirm_when_stored(
-                async move {
-                    match crate::local_state::archive_message(&mut c, a, id, ar).await {
-                        Ok(()) => true,
-                        Err(e) => {
-                            crate::log::local_state_failure("archive message", e);
-                            false
+            let undo_alias = alias.to_string();
+            // Bound to the inbox shown now: the user may switch identity
+            // while the archive write is being confirmed.
+            let removal = inbox.read().defer_removal(&[id], inbox_data);
+            // The inbox removal is signed and sent only once the archived
+            // copy is stored: removing first would lose the message whenever
+            // the archive write fails or is never answered.
+            confirm_then_remove(
+                "archive message",
+                crate::local_state::archive_message(a, id, ar),
+                &CONFIRM_ARCHIVE,
+                move || {
+                    let result = removal.run(client);
+                    async move {
+                        match result {
+                            Ok(fut) => fut.await,
+                            Err(e) => crate::log::error(
+                                format!("removing archived message {id} from the inbox: {e}"),
+                                None,
+                            ),
                         }
                     }
                 },
-                &CONFIRM_ARCHIVE,
+                move || crate::local_state::local_unarchive_message(&undo_alias, id),
             );
+            post.apply(&mut menu_selection);
+            return;
         }
     }
     let result = inbox
@@ -4915,9 +5059,7 @@ fn archive_message(
     });
     post.apply(&mut menu_selection);
     // Nothing was written that a node must confirm.
-    if alias.is_empty() || cfg!(not(feature = "use-node")) {
-        crate::toast::push_toast(CONFIRM_ARCHIVE.done, crate::toast::ToastLevel::Success);
-    }
+    crate::toast::push_toast(CONFIRM_ARCHIVE.done, crate::toast::ToastLevel::Success);
 }
 
 /// Shared Delete logic (#270 BLOCKER-1): drop any local kept/archived copies
@@ -4937,7 +5079,6 @@ fn delete_message(
         crate::local_state::local_delete_message(alias, id);
         #[cfg(feature = "use-node")]
         {
-            let mut c = client.clone();
             let a = alias.to_string();
             // spawn_forever: the caller runs post.apply() right after this,
             // which navigates away and unmounts the message view. A bare
@@ -4945,15 +5086,8 @@ fn delete_message(
             // unmount, so the deletion never committed to the node and the
             // message returned after reload (#286).
             confirm_when_stored(
-                async move {
-                    match crate::local_state::delete_message(&mut c, a, id).await {
-                        Ok(()) => true,
-                        Err(e) => {
-                            crate::log::error(format!("delete_message failed: {e}"), None);
-                            false
-                        }
-                    }
-                },
+                "delete_message",
+                crate::local_state::delete_message(a, id),
                 &CONFIRM_DELETE,
             );
         }
@@ -4997,22 +5131,68 @@ const CONFIRM_DELETE: Confirmation = Confirmation {
 const CONFIRM_ARCHIVE: Confirmation = Confirmation {
     pending: "Archiving…",
     done: "Archived",
-    failed: "Couldn't confirm the archive was saved; the message may be lost after a reload",
-    unconfirmed: "Couldn't confirm the archive was saved; the message may be lost after a reload",
+    failed: "Couldn't archive the message; it stays in your inbox",
+    unconfirmed: "Couldn't confirm the archive was saved; the message stays in your inbox",
 };
 
-/// How long to wait for the node to answer before saying the write could not
-/// be confirmed.
+/// Run `write`, then `then()` only if the write is stored. Returns the
+/// outcome. Shared by archive (the inbox removal must wait for the archived
+/// copy) and its tests.
+pub(crate) async fn store_then<W, F, R>(write: W, then: F) -> crate::local_state::Stored
+where
+    W: std::future::Future<Output = Result<(), crate::DynError>>,
+    F: FnOnce() -> R,
+    R: std::future::Future<Output = ()>,
+{
+    let result = write.await;
+    if let Err(e) = &result {
+        crate::log::error(format!("local-state write failed: {e}"), None);
+    }
+    let outcome = crate::local_state::Stored::of(&result);
+    if outcome == crate::local_state::Stored::Yes {
+        then().await;
+    }
+    outcome
+}
+
+/// [`confirm_when_stored`], but `then()` runs only once the write is stored,
+/// and `undo()` runs when it is not (the optimistic change is reverted).
 #[cfg(feature = "use-node")]
-const CONFIRM_TIMEOUT_MS: u32 = 20_000;
+fn confirm_then_remove<R: std::future::Future<Output = ()> + 'static>(
+    what: &'static str,
+    write: impl std::future::Future<Output = Result<(), crate::DynError>> + 'static,
+    say: &'static Confirmation,
+    then: impl FnOnce() -> R + 'static,
+    undo: impl FnOnce() + 'static,
+) {
+    use crate::local_state::Stored;
+    use crate::toast::{ToastLevel, dismiss_toast_in, push_sticky_toast_to, push_toast_to};
+    let toasts = use_context::<crate::toast::ToastQueue>();
+    let pending = push_sticky_toast_to(toasts, say.pending, ToastLevel::Info);
+    let _task = dioxus_core::spawn_forever(async move {
+        let outcome = store_then(write, then).await;
+        dismiss_toast_in(toasts, pending);
+        match outcome {
+            Stored::Yes => push_toast_to(toasts, say.done, ToastLevel::Success),
+            Stored::Failed => {
+                crate::log::error(format!("{what}: not stored"), None);
+                undo();
+                push_toast_to(toasts, say.failed, ToastLevel::Error)
+            }
+            Stored::Unknown => {
+                undo();
+                push_toast_to(toasts, say.unconfirmed, ToastLevel::Warning)
+            }
+        };
+    });
+}
 
 /// Run a local-state `write` and confirm it only once it is stored. `pending`
-/// shows from now until the node has answered every local-state request sent
-/// so far, then `done`. The UI applies the change at once, but until the node
-/// answers, a reload loses it (#286), so `done` must not appear before then.
-/// A failed write, or an error answer, shows `failed`; no answer within
-/// [`CONFIRM_TIMEOUT_MS`], or one that cannot be attributed, `unconfirmed`.
-/// Runs as one task so the outcome cannot overtake the write.
+/// shows from now until the mail delegate has acknowledged the write, then
+/// `done`. The UI applies the change at once, but until the delegate
+/// acknowledges it a reload loses it (#286), so `done` must not appear before
+/// then. A write the delegate refuses shows `failed`; one it never answers,
+/// `unconfirmed`. Runs as one task so the outcome cannot overtake the write.
 ///
 /// `spawn_forever`: the caller navigates away and unmounts the view right
 /// after this, which would cancel a bare `spawn()` before the write is sent.
@@ -5020,7 +5200,8 @@ const CONFIRM_TIMEOUT_MS: u32 = 20_000;
 /// task runs outside the component tree, where `use_context` cannot find it.
 #[cfg(feature = "use-node")]
 fn confirm_when_stored(
-    write: impl std::future::Future<Output = bool> + 'static,
+    what: &'static str,
+    write: impl std::future::Future<Output = Result<(), crate::DynError>> + 'static,
     say: &'static Confirmation,
 ) {
     use crate::local_state::Stored;
@@ -5028,12 +5209,15 @@ fn confirm_when_stored(
     let toasts = use_context::<crate::toast::ToastQueue>();
     let pending = push_sticky_toast_to(toasts, say.pending, ToastLevel::Info);
     let _task = dioxus_core::spawn_forever(async move {
-        let outcome = if write.await {
-            let timeout = gloo_timers::future::TimeoutFuture::new(CONFIRM_TIMEOUT_MS);
-            crate::local_state::writes_stored(timeout).await
-        } else {
-            Stored::Failed
-        };
+        // The delegate acknowledges each write itself, and a call it never
+        // answers ends as `Unknown` (never assumed either way). The write is
+        // never raced against a timer: dropping it midway would leave a
+        // multi-step write half done.
+        let result = write.await;
+        if let Err(e) = &result {
+            crate::log::error(format!("{what} failed: {e}"), None);
+        }
+        let outcome = Stored::of(&result);
         dismiss_toast_in(toasts, pending);
         match outcome {
             Stored::Yes => push_toast_to(toasts, say.done, ToastLevel::Success),
@@ -5118,26 +5302,7 @@ fn OpenMessage(msg: Message) -> Element {
             };
             crate::local_state::local_mark_read(&alias, msg.id, kept.clone());
             #[cfg(feature = "use-node")]
-            {
-                let mut client_clone = client.clone();
-                let alias_for_send = alias.clone();
-                // spawn_forever: same as the group-open path — navigating
-                // away right after opening unmounts this view and a bare
-                // spawn() would cancel the MarkRead write, resurfacing the
-                // message as unread on reload (#286 read-state variant).
-                let _task = dioxus_core::spawn_forever(async move {
-                    if let Err(e) = crate::local_state::mark_read(
-                        &mut client_clone,
-                        alias_for_send,
-                        msg.id,
-                        kept,
-                    )
-                    .await
-                    {
-                        crate::log::local_state_failure("mark message read", e);
-                    }
-                });
-            }
+            crate::local_state::persist_read(&alias, msg.id, kept, "mark message read");
         }
     }
 
@@ -5331,6 +5496,26 @@ fn OpenMessage(msg: Message) -> Element {
 
 use crate::toast::ToastView;
 
+/// Shown when the draft being edited was sent or discarded in another tab.
+/// It is not sent from here: that could send it twice.
+const DRAFT_GONE_ELSEWHERE: &str = "This draft was sent or discarded in another tab, so it isn't saved or sent from here. Start a new message if you still want to send it.";
+
+/// The compose sheet's autosave state, from the latest autosave token, the
+/// last one the delegate stored and the last one that failed: `saved`,
+/// `failed` (shown with a retry, never left as `pending`), or `pending`
+/// while a save is still on its way. Exposed as `data-autosave`.
+fn autosave_state(token: u64, saved: u64, failed: u64) -> &'static str {
+    if token == 0 {
+        "pending"
+    } else if saved == token {
+        "saved"
+    } else if failed == token {
+        "failed"
+    } else {
+        "pending"
+    }
+}
+
 #[allow(non_snake_case)]
 fn ComposeSheet() -> Element {
     let mut menu_selection = use_context::<Signal<menu::MenuSelection>>();
@@ -5338,6 +5523,7 @@ fn ComposeSheet() -> Element {
     let mut inbox = use_context::<Signal<InboxView>>();
     let user = use_context::<Signal<User>>();
     let user_alias = user.read().logged_id().unwrap().alias.to_string();
+    let sender_addr = user.read().logged_id().unwrap().addr;
     // "Sending as <fingerprint>" surface (#51) — shows the user which
     // ML-DSA key the outgoing message will be signed under.
     let (sender_fp_short, sender_fp_full) = {
@@ -5376,6 +5562,25 @@ fn ComposeSheet() -> Element {
     let initial_quoted_excerpt = prefill.as_ref().and_then(|p| p.quoted_excerpt.clone());
 
     let mut to = use_signal(|| initial_to.clone());
+    // The address of the recipient chosen in the To field. A reopened draft
+    // brings the one it recorded; otherwise the prefilled name is resolved
+    // now, which is when it is chosen. Every later edit of the field
+    // re-resolves it, and sending goes to this address only
+    // (`address_book::resolve_for_send`).
+    let reopened_draft = prefill.as_ref().and_then(|p| p.draft_id.clone());
+    let alias_for_choice = user_alias.clone();
+    // A reopened draft that recorded nothing and whose name has become
+    // ambiguous starts with no recipient (`ambiguous_draft`): sending asks
+    // the user to choose, and typing or picking a recipient chooses.
+    let initial_to_for_choice = initial_to.clone();
+    let (initial_address, initially_ambiguous) = use_hook(move || {
+        let recorded = reopened_draft
+            .as_ref()
+            .and_then(|id| crate::local_state::draft_recipient(&alias_for_choice, id));
+        address_book::initial_choice(recorded, reopened_draft.is_some(), &initial_to_for_choice)
+    });
+    let mut chosen_address = use_signal(move || initial_address);
+    let mut ambiguous_draft = use_signal(move || initially_ambiguous);
     let mut title = use_signal(|| initial_subj.clone());
     let mut content = use_signal(|| initial_body.clone());
     let draft_id = use_signal(|| initial_draft_id.clone());
@@ -5396,6 +5601,24 @@ fn ComposeSheet() -> Element {
     // it still matches when the timer elapses — older keystrokes are silently
     // dropped. Send / Discard bump the token to cancel a pending save.
     let mut autosave_token = use_signal(|| 0u64);
+    // The latest edit's token, outside the signal system: a pending save
+    // re-issued when this sheet unmounts reads it after the signals are gone.
+    #[cfg(feature = "use-node")]
+    let latest_edit = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(0u64)));
+    #[cfg(feature = "use-node")]
+    let latest_edit_for_delete = latest_edit.clone();
+    // Set when an autosave finds this draft removed in another tab
+    // (discarded or sent there): autosave stops, so the draft is not brought
+    // back, and the sheet says so.
+    let draft_gone = use_signal(|| false);
+    // The last autosave token whose write the delegate acknowledged. Equal
+    // to `autosave_token` when what is on screen is stored; exposed on the
+    // sheet as `data-autosave` so a test can wait for it instead of sleeping.
+    let saved_token = use_signal(|| 0u64);
+    // The last autosave token whose write failed (unanswered, or refused):
+    // the sheet then says the draft is not saved and offers a retry, rather
+    // than staying "pending" with nothing on screen.
+    let failed_token = use_signal(|| 0u64);
     /// Idle window before a draft is flushed to the delegate. Picked to feel
     /// instant for normal typing while still coalescing fast bursts.
     const AUTOSAVE_DEBOUNCE_MS: u32 = 500;
@@ -5409,7 +5632,7 @@ fn ComposeSheet() -> Element {
         let to_v = to.read().clone();
         let subj_v = title.read().clone();
         let body_v = content.read().clone();
-        if to_v.is_empty() && subj_v.is_empty() && body_v.is_empty() {
+        if (to_v.is_empty() && subj_v.is_empty() && body_v.is_empty()) || *draft_gone.read() {
             return;
         }
         let id = draft_id.read().clone();
@@ -5427,6 +5650,8 @@ fn ComposeSheet() -> Element {
             quoted_excerpt: quoted_excerpt.read().clone(),
         };
         crate::local_state::local_save_draft(&alias_for_save, &id, draft.clone());
+        let to_address = chosen_address.read().clone();
+        crate::local_state::set_draft_recipient(&alias_for_save, &id, to_address.clone());
 
         // Bump the token, then schedule a delayed delegate save that
         // double-checks the token before firing. If another keystroke landed
@@ -5435,19 +5660,72 @@ fn ComposeSheet() -> Element {
         autosave_token.set(my_token);
         #[cfg(feature = "use-node")]
         {
-            let mut client_clone = client.clone();
             let alias = alias_for_save.clone();
             let token_signal = autosave_token;
+            latest_edit.set(my_token);
+            let latest = latest_edit.clone();
+            // Counted from the keystroke until this edit is stored, failed,
+            // or superseded, so the page knows it is not stored yet
+            // (`pending_saves`). The flush guard below owns it.
+            let in_flight = crate::pending_saves::begin();
+            // Closing the sheet (✕, the veil, navigating away) within the
+            // debounce, or while the save is under way, drops the task below:
+            // the last edit would then live only in this page and be gone on
+            // reload. If it is still the latest edit, save it in a task that
+            // outlives the sheet. Built here, not inside the task, so it
+            // fires even if the sheet closes before the task first runs;
+            // everything it needs is moved in, since the sheet's signals are
+            // gone by then.
+            let flush = {
+                let (alias, id, draft, to_address) =
+                    (alias.clone(), id.clone(), draft.clone(), to_address.clone());
+                OnCancel::new(move || {
+                    // Released when this closure ends, after the flush's own
+                    // count is taken: the count never touches zero between.
+                    let _edit = in_flight;
+                    if latest.get() == my_token {
+                        let in_flight = crate::pending_saves::begin();
+                        let _task = dioxus_core::spawn_forever(async move {
+                            let _in_flight = in_flight;
+                            if let Err(e) =
+                                crate::local_state::save_draft(alias, id, draft, to_address).await
+                            {
+                                crate::log::local_state_failure("save draft on close", e);
+                            }
+                        });
+                    }
+                })
+            };
             spawn(async move {
                 gloo_timers::future::TimeoutFuture::new(AUTOSAVE_DEBOUNCE_MS).await;
                 if *token_signal.read() != my_token {
+                    // A later edit superseded this one; its task saves.
+                    flush.disarm();
                     return;
                 }
-                if let Err(e) =
-                    crate::local_state::save_draft(&mut client_clone, alias, id, draft).await
+                match crate::local_state::save_draft(alias.clone(), id.clone(), draft, to_address)
+                    .await
                 {
-                    crate::log::local_state_failure("save draft", e);
+                    Ok(crate::local_state::DraftSave::GoneElsewhere) => {
+                        // Discarded or sent in another tab: stop autosaving
+                        // and drop the local copy, so it neither comes back
+                        // here nor gets sent twice.
+                        let mut gone = draft_gone;
+                        gone.set(true);
+                        crate::local_state::local_delete_draft(&alias, &id);
+                    }
+                    Ok(crate::local_state::DraftSave::Stored) => {
+                        let mut saved = saved_token;
+                        saved.set(my_token);
+                    }
+                    Ok(crate::local_state::DraftSave::Discarded) => {}
+                    Err(e) => {
+                        let mut failed = failed_token;
+                        failed.set(my_token);
+                        crate::log::local_state_failure("save draft", e);
+                    }
                 }
+                flush.disarm();
             });
         }
     });
@@ -5484,10 +5762,13 @@ fn ComposeSheet() -> Element {
         // DeleteDraft that follows.
         let bumped = *autosave_token.read() + 1;
         autosave_token.set(bumped);
+        // The close-flush checks this one: Send or Discard must not fire a
+        // save of the draft they just removed.
+        #[cfg(feature = "use-node")]
+        latest_edit_for_delete.set(bumped);
         crate::local_state::local_delete_draft(&alias_for_delete, &id);
         #[cfg(feature = "use-node")]
         {
-            let mut client_clone = client.clone();
             let alias = alias_for_delete.clone();
             // spawn_forever: delete_draft_now fires on Send, which navigates
             // away and unmounts this component. A bare spawn() would cancel
@@ -5495,33 +5776,29 @@ fn ComposeSheet() -> Element {
             // persisted on the node — it then reappears (and the sent message
             // re-derives as a Draft) after reload (#286).
             let _task = dioxus_core::spawn_forever(async move {
-                if let Err(e) = crate::local_state::delete_draft(&mut client_clone, alias, id).await
-                {
+                if let Err(e) = crate::local_state::delete_draft(alias, id).await {
                     crate::log::local_state_failure("delete draft", e);
                 }
             });
         }
     });
-    let send_msg = move |_| {
+    let send_now = use_callback(move |()| {
         let to_val = to.read().clone();
-        // Try local alias first; fall back to raw bs58 inbox address so
-        // a user can paste an address into the To field and reach a
-        // contact without re-typing the alias.
-        let recipient = match address_book::lookup(&to_val)
-            .or_else(|| address_book::lookup_by_bs58(&to_val))
-        {
-            Some(r) => r,
-            None => {
+        // Mail goes to the address recorded when the recipient was chosen
+        // (an alias, a clash label or a pasted bs58 inbox address), and is
+        // refused if the field now names a different key.
+        let recipient = match address_book::resolve_for_send(
+            &to_val,
+            chosen_address.read().as_deref(),
+            *ambiguous_draft.read(),
+        ) {
+            Ok(r) => r,
+            Err(message) => {
                 crate::log::error(
-                    format!("couldn't find key for `{to_val}`"),
+                    format!("couldn't resolve the recipient `{to_val}`: {message}"),
                     Some(TryNodeAction::GetAlias),
                 );
-                crate::toast::push_toast(
-                    format!(
-                        "Recipient `{to_val}` is not in your address book. Import their contact before sending."
-                    ),
-                    crate::toast::ToastLevel::Error,
-                );
+                crate::toast::push_toast(message, crate::toast::ToastLevel::Error);
                 return;
             }
         };
@@ -5661,6 +5938,7 @@ fn ComposeSheet() -> Element {
         let send_succeeded = match inbox.write().send_message(
             client.clone(),
             &alias,
+            sender_addr,
             recipient_ek,
             recipient_vk,
             recipient_required_tier,
@@ -5680,7 +5958,17 @@ fn ComposeSheet() -> Element {
                 // which silently killed every send before the AFT
                 // request hit the wire.
                 futs.into_iter().for_each(|f| {
-                    let _task = dioxus_core::spawn_forever(f);
+                    // Counted from now, not from the task's first poll, so a
+                    // reload in between is not an uncounted loss. This covers
+                    // the send until its token is requested; the pending-ack
+                    // entry queued below (`enqueue_pending_sent_ack`) counts
+                    // it from the Send click until its inbox update is
+                    // answered, failed or swept.
+                    let in_flight = crate::pending_saves::begin();
+                    let _task = dioxus_core::spawn_forever(async move {
+                        let _in_flight = in_flight;
+                        f.await;
+                    });
                 });
                 true
             }
@@ -5728,7 +6016,7 @@ fn ComposeSheet() -> Element {
             // Enqueue against the recipient's inbox key so the
             // UpdateResponse handler can flip the right Sent row.
             #[cfg(feature = "use-node")]
-            match inbox_key_for_ack {
+            let unanswerable = match inbox_key_for_ack {
                 Ok(inbox_key) => {
                     crate::inbox::enqueue_pending_sent_ack(
                         inbox_key,
@@ -5736,18 +6024,30 @@ fn ComposeSheet() -> Element {
                         sent_id.clone(),
                         sent_at_ms,
                     );
+                    false
                 }
                 Err(e) => {
+                    // Nothing will ever answer this send, so the row must not
+                    // stay Pending: fail it now, and store it Failed below.
                     crate::log::error(
-                        format!("inbox_key_for failed; sent row will stay Pending: {e}"),
+                        format!("inbox_key_for failed; marking the sent row failed: {e}"),
                         None,
                     );
+                    let _ = crate::local_state::local_set_sent_delivery_state(
+                        &sender_alias,
+                        &sent_id,
+                        freenet_mail_wire_v1::local_state::DeliveryState::Failed,
+                    );
+                    true
                 }
-            }
+            };
 
             #[cfg(feature = "use-node")]
             {
-                let mut client_clone = client.clone();
+                let mut sent = sent;
+                if unanswerable {
+                    sent.delivery_state = freenet_mail_wire_v1::local_state::DeliveryState::Failed;
+                }
                 let alias_async = sender_alias.clone();
                 let id_async = sent_id.clone();
                 // spawn_forever, not spawn: the send handler navigates away
@@ -5756,14 +6056,10 @@ fn ComposeSheet() -> Element {
                 // unmount, so the SaveSent delegate write never reached the
                 // wire — the message persisted only in the in-session
                 // snapshot and re-derived as a Draft after reload (#286).
+                let in_flight = crate::pending_saves::begin();
                 let _task = dioxus_core::spawn_forever(async move {
-                    if let Err(e) = crate::local_state::save_sent(
-                        &mut client_clone,
-                        alias_async,
-                        id_async,
-                        sent,
-                    )
-                    .await
+                    let _in_flight = in_flight;
+                    if let Err(e) = crate::local_state::save_sent(alias_async, id_async, sent).await
                     {
                         crate::log::local_state_failure("save sent message", e);
                     }
@@ -5785,6 +6081,75 @@ fn ComposeSheet() -> Element {
         if post.push_success_toast {
             crate::toast::push_toast("Sent", crate::toast::ToastLevel::Success);
         }
+    });
+
+    // Before sending, make sure the draft was not sent or discarded in
+    // another tab meanwhile: this page may hold it untouched, with no
+    // autosave to notice, and sending it would send it twice.
+    //
+    // Two tabs pressing Send on the same draft within the same couple of
+    // delegate round trips can both pass this check; that window is left
+    // open. Closing it would mean claiming the draft before sending (a
+    // compare-and-swap delete), and then un-claiming it if the send fails.
+    let alias_for_check = user_alias.clone();
+    // Set while a send is being checked or sent, so a second click in the
+    // meantime does not send the message again (`claim_send`).
+    let mut sending = use_signal(|| false);
+    let send_msg = move |_| {
+        if *draft_gone.read() {
+            crate::toast::push_toast(DRAFT_GONE_ELSEWHERE, crate::toast::ToastLevel::Warning);
+            return;
+        }
+        if !claim_send(&mut sending.write()) {
+            return;
+        }
+        #[cfg(feature = "use-node")]
+        {
+            let alias = alias_for_check.clone();
+            let id = draft_id.read().clone();
+            spawn(async move {
+                // Closing the sheet while this check runs drops the task:
+                // the message is then not sent, and the user is told so
+                // rather than left to assume it went.
+                let cancelled = OnCancel::new(|| {
+                    crate::toast::push_toast_detached(
+                        SEND_CANCELLED_BY_CLOSE,
+                        crate::toast::ToastLevel::Warning,
+                    );
+                });
+                let checked =
+                    crate::local_state::check_draft_before_send(alias.clone(), id.clone()).await;
+                cancelled.disarm();
+                // `send_now` is synchronous, so the sheet is still mounted
+                // when the send is released below, whatever it did.
+                match checked {
+                    Ok(crate::local_state::DraftCheck::Current) => send_now(()),
+                    Ok(crate::local_state::DraftCheck::GoneElsewhere) => {
+                        let mut gone = draft_gone;
+                        gone.set(true);
+                        crate::local_state::local_delete_draft(&alias, &id);
+                        crate::toast::push_toast(
+                            DRAFT_GONE_ELSEWHERE,
+                            crate::toast::ToastLevel::Warning,
+                        );
+                    }
+                    Err(e) => {
+                        crate::log::local_state_failure("check the draft before sending", e);
+                        crate::toast::push_toast(
+                            "Couldn't confirm this draft wasn't already sent from another tab. Try again.",
+                            crate::toast::ToastLevel::Error,
+                        );
+                    }
+                }
+                release_send(&mut sending.write());
+            });
+        }
+        #[cfg(not(feature = "use-node"))]
+        {
+            let _ = &alias_for_check;
+            send_now(());
+            release_send(&mut sending.write());
+        }
     };
 
     rsx! {
@@ -5792,6 +6157,7 @@ fn ComposeSheet() -> Element {
             onclick: move |_| { menu_selection.write().at_new_msg(); },
             div { class: "sheet",
                 "data-testid": testid::FM_COMPOSE_SHEET,
+                "data-autosave": autosave_state(*autosave_token.read(), *saved_token.read(), *failed_token.read()),
                 onclick: move |ev| { ev.stop_propagation(); },
                 div { class: "sheet-head",
                     span { class: "sheet-title", "New message" }
@@ -5831,6 +6197,8 @@ fn ComposeSheet() -> Element {
                                 aria_expanded: "{has_suggestions}",
                                 oninput: move |ev| {
                                     to.set(ev.value());
+                                    chosen_address.set(address_book::address_choice(&to.read()));
+                                    ambiguous_draft.set(false);
                                     ac_highlighted.set(-1);
                                     ac_open.set(true);
                                     autosave(());
@@ -5861,6 +6229,8 @@ fn ComposeSheet() -> Element {
                                             let idx = *ac_highlighted.read();
                                             if idx >= 0 && idx < len {
                                                 let alias = suggestions[idx as usize].local_alias.to_string();
+                                                chosen_address.set(address_book::address_choice(&alias));
+                                                ambiguous_draft.set(false);
                                                 to.set(alias);
                                                 ac_highlighted.set(-1);
                                                 ac_open.set(false);
@@ -5930,6 +6300,8 @@ fn ComposeSheet() -> Element {
                                                     onpointerdown: move |ev| {
                                                         ev.prevent_default();
                                                         ac_ignore_blur.set(true);
+                                                        chosen_address.set(address_book::address_choice(&alias_fill));
+                                                        ambiguous_draft.set(false);
                                                         to.set(alias_fill.clone());
                                                         ac_highlighted.set(-1);
                                                         ac_open.set(false);
@@ -5993,6 +6365,28 @@ fn ComposeSheet() -> Element {
                         rsx! {}
                     }
                 }
+                if *draft_gone.read() {
+                    div {
+                        class: "sheet-recipient-hint",
+                        "data-testid": "compose-draft-gone",
+                        role: "status",
+                        "aria-live": "polite",
+                        "{DRAFT_GONE_ELSEWHERE}"
+                    }
+                } else if autosave_state(*autosave_token.read(), *saved_token.read(), *failed_token.read()) == "failed" {
+                    div {
+                        class: "sheet-recipient-hint",
+                        "data-testid": "compose-draft-not-saved",
+                        role: "alert",
+                        "This draft isn't saved. "
+                        button {
+                            class: "btn btn-secondary",
+                            "data-testid": "compose-draft-retry",
+                            onclick: move |_| autosave(()),
+                            "Retry"
+                        }
+                    }
+                }
                 div { class: "sheet-field",
                     span { class: "field-lbl", "Re" }
                     input {
@@ -6028,8 +6422,9 @@ fn ComposeSheet() -> Element {
                         button {
                             class: "btn btn-primary",
                             "data-testid": testid::FM_SEND,
+                            disabled: *sending.read(),
                             onclick: send_msg,
-                            "Send"
+                            if *sending.read() { "Sending…" } else { "Send" }
                         }
                     }
                 }
@@ -6039,8 +6434,116 @@ fn ComposeSheet() -> Element {
 }
 
 #[cfg(test)]
+mod deferred_removal_tests {
+    use super::{InboxView, UserId};
+
+    /// Inboxes in the order their state arrived, which is not the order of
+    /// their owners' ids: bob's state came in first.
+    const ARRIVAL_ORDER: [(&str, UserId); 2] =
+        [("bob's inbox", UserId(1)), ("alice's inbox", UserId(0))];
+
+    fn owner(inbox: &(&'static str, UserId)) -> Option<UserId> {
+        Some(inbox.1)
+    }
+
+    /// An archive removes the message only once its write is confirmed, and
+    /// the user can switch identity meanwhile: the removal must go to the
+    /// inbox that was shown when the archive started, and it is found by its
+    /// owner, not by its position in the list.
+    #[test]
+    fn a_deferred_removal_binds_the_shown_identitys_inbox_by_owner() {
+        let view = InboxView::new();
+        let (alice, bob) = (UserId(0), UserId(1));
+        *view.active_id.borrow_mut() = alice;
+        let removal = view.defer_removal_in(&[7], &ARRIVAL_ORDER, owner);
+        *view.active_id.borrow_mut() = bob;
+        assert_eq!(removal.target, alice);
+        assert_eq!(removal.ids, vec![7]);
+        assert_eq!(removal.inbox.map(|ib| ib.0), Some("alice's inbox"));
+        assert_eq!(view.active_user(), bob);
+    }
+
+    /// The archive flow end to end, minus the network: the removal is bound
+    /// when the archive starts, the user switches identity while the archive
+    /// write is awaited (`store_then`, as archive uses), and the removal then
+    /// runs against alice's inbox, not the one shown by then nor the one at
+    /// alice's id's position.
+    #[test]
+    fn a_removal_after_an_identity_switch_mid_wait_goes_to_the_original_inbox() {
+        use futures::executor::block_on;
+        use std::cell::Cell;
+        let view = InboxView::new();
+        let (alice, bob) = (UserId(0), UserId(1));
+        *view.active_id.borrow_mut() = alice;
+
+        let removal = view.defer_removal_in(&[7], &ARRIVAL_ORDER, owner);
+        let picked = Cell::new(None);
+        let outcome = block_on(super::store_then(
+            async {
+                // The user switches identity while the write is confirmed.
+                *view.active_id.borrow_mut() = bob;
+                Ok(())
+            },
+            || async {
+                picked.set(removal.inbox.map(|ib| ib.0));
+            },
+        ));
+        assert_eq!(outcome, crate::local_state::Stored::Yes);
+        assert_eq!(view.active_user(), bob, "the switch happened mid-wait");
+        assert_eq!(picked.get(), Some("alice's inbox"));
+
+        // An inbox that is not loaded is reported, never a panic.
+        let unloaded = InboxView::new();
+        *unloaded.active_id.borrow_mut() = UserId(5);
+        assert!(
+            unloaded
+                .defer_removal_in(&[1], &ARRIVAL_ORDER, owner)
+                .inbox
+                .is_none()
+        );
+    }
+
+    /// An inbox whose owner the routing does not know is never chosen, even
+    /// when it sits at the target's position.
+    #[test]
+    fn an_inbox_with_an_unknown_owner_is_never_picked() {
+        let inboxes = [("unrouted", None), ("alice's inbox", Some(UserId(0)))];
+        let picked = super::pick_inbox(&inboxes, UserId(0), |ib| ib.1);
+        assert_eq!(picked.map(|ib| ib.0), Some("alice's inbox"));
+        assert_eq!(super::pick_inbox(&inboxes[..1], UserId(0), |ib| ib.1), None);
+    }
+}
+
+#[cfg(test)]
 mod compose_post_send_tests {
-    use super::compose_post_send;
+    use super::{OnCancel, claim_send, compose_post_send, release_send};
+
+    /// A send task dropped midway (the compose sheet closed during the
+    /// check) reports it; one that got past the check does not.
+    #[test]
+    fn a_send_cut_off_by_closing_the_sheet_is_reported() {
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let f = fired.clone();
+        drop(OnCancel::new(move || f.set(true)));
+        assert!(fired.get(), "dropped before the check finished");
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let f = fired.clone();
+        OnCancel::new(move || f.set(true)).disarm();
+        assert!(!fired.get(), "disarmed after the check");
+    }
+
+    /// A second Send while the first is still being checked or sent is
+    /// ignored, so one message is not sent twice from one tab; once the
+    /// first settles, Send works again.
+    #[test]
+    fn a_second_send_click_while_one_is_in_flight_is_ignored() {
+        let mut sending = false;
+        assert!(claim_send(&mut sending), "the first click sends");
+        assert!(!claim_send(&mut sending), "a double click does not");
+        assert!(!claim_send(&mut sending), "nor a third");
+        release_send(&mut sending);
+        assert!(claim_send(&mut sending), "after it settles, Send works");
+    }
 
     /// Regression for #230. Before the fix, `delete_draft_now`, navigation,
     /// and the green "Sent" toast all ran unconditionally after the
@@ -6940,5 +7443,57 @@ mod folder_sort_tests {
         a.sort_by(sort_cmp_archive);
         let second: Vec<u64> = a.iter().map(|(id, _)| *id).collect();
         assert_eq!(first, second, "archive sort must be idempotent");
+    }
+}
+
+#[cfg(test)]
+mod autosave_state_tests {
+    use super::autosave_state;
+
+    /// A save that failed shows as failed (with a retry), never as
+    /// `pending` for ever; a newer keystroke's save is pending again.
+    #[test]
+    fn a_failed_autosave_is_shown_as_failed_not_pending() {
+        assert_eq!(autosave_state(0, 0, 0), "pending");
+        assert_eq!(autosave_state(3, 0, 0), "pending");
+        assert_eq!(autosave_state(3, 3, 0), "saved");
+        assert_eq!(autosave_state(3, 2, 3), "failed");
+        assert_eq!(autosave_state(4, 2, 3), "pending");
+        assert_eq!(autosave_state(4, 4, 3), "saved");
+    }
+}
+
+#[cfg(test)]
+mod archive_order_tests {
+    use super::store_then;
+    use crate::local_state::Stored;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    fn run(write: Result<(), crate::DynError>) -> (Stored, bool) {
+        let removed = Rc::new(Cell::new(false));
+        let r = removed.clone();
+        let outcome = futures::executor::block_on(store_then(async move { write }, move || {
+            r.set(true);
+            async {}
+        }));
+        (outcome, removed.get())
+    }
+
+    #[test]
+    fn the_inbox_removal_waits_for_the_archived_copy() {
+        assert_eq!(run(Ok(())), (Stored::Yes, true));
+    }
+
+    #[test]
+    fn a_failed_archive_write_leaves_the_message_in_the_inbox() {
+        assert_eq!(run(Err("store refused".into())), (Stored::Failed, false));
+    }
+
+    #[test]
+    fn an_unanswered_archive_write_leaves_the_message_in_the_inbox() {
+        let unknown: crate::DynError =
+            Box::new(crate::mail_delegate::CallError::Unknown("no answer".into()));
+        assert_eq!(run(Err(unknown)), (Stored::Unknown, false));
     }
 }

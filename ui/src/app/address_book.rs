@@ -257,6 +257,217 @@ thread_local! {
     /// some writers (own-identity register, offline seed) don't bump that
     /// signal.
     static ADDRESS_BOOK_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
+    /// Contacts shown under a clash label because their alias was ambiguous:
+    /// label → the alias they clashed on. Tracked explicitly, not inferred
+    /// from the label's shape, so a contact the user named `bob~work` is an
+    /// ordinary contact.
+    static RELABELLED: RefCell<HashMap<String, Rc<str>>> = RefCell::new(HashMap::new());
+}
+
+/// Record that the contact now shown as `label` lost the alias `original`.
+pub(crate) fn note_relabelled(label: &str, original: &str) {
+    RELABELLED.with(|r| r.borrow_mut().insert(label.to_string(), original.into()));
+}
+
+/// Whether `label` is a clash label given to a contact (see
+/// [`note_relabelled`]).
+fn is_relabelled(label: &str) -> bool {
+    RELABELLED.with(|r| r.borrow().contains_key(label))
+}
+
+/// The labels of contacts moved off `alias` because it was ambiguous.
+pub fn relabelled_from(alias: &str) -> Vec<String> {
+    let mut labels: Vec<String> = RELABELLED.with(|r| {
+        r.borrow()
+            .iter()
+            .filter(|(_, original)| original.as_ref() == alias)
+            .map(|(label, _)| label.clone())
+            .collect()
+    });
+    labels.sort();
+    labels
+}
+
+/// Whether typing `alias` is ambiguous: it resolves to a recipient, but a
+/// contact that used to answer to it was moved to a clash label, so what
+/// the user means by it is not certain.
+pub fn is_ambiguous_name(alias: &str) -> bool {
+    !relabelled_from(alias).is_empty()
+}
+
+/// `base`, or the first `base-2`, `base-3`, … that no entry holds.
+fn free_label(ab: &HashMap<String, Entry>, base: Rc<str>) -> Rc<str> {
+    free_label_by(base, |label| ab.contains_key(label))
+}
+
+/// `base`, or the first `base-2`, `base-3`, … for which `taken` is false.
+pub(crate) fn free_label_by(base: Rc<str>, taken: impl Fn(&str) -> bool) -> Rc<str> {
+    if !taken(&base) {
+        return base;
+    }
+    (2..)
+        .map(|n| Rc::<str>::from(format!("{base}-{n}")))
+        .find(|label| !taken(label))
+        .expect("an unused label exists")
+}
+
+/// The address to record when the user types or picks `typed` in the To
+/// field: the one recipient it names, or `None` when it names nobody. A
+/// typed or picked name means the entry that holds it now, so it is never
+/// refused as ambiguous; only a reopened draft that recorded nothing is
+/// (see [`initial_choice`]).
+pub fn address_choice(typed: &str) -> Option<String> {
+    lookup(typed)
+        .or_else(|| lookup_by_bs58(typed))
+        .as_ref()
+        .map(recipient_address)
+}
+
+/// The recipient a compose sheet starts with: what the draft recorded
+/// (`recorded`), or else the name in the To field resolved now, which is
+/// when it is chosen. A reopened draft (`reopened`) that recorded nothing,
+/// carried over from older data, whose name has become ambiguous since
+/// ([`is_ambiguous_name`]) is not resolved to a guess: it starts with no
+/// recipient and `true`, and sending asks the user to choose again.
+pub fn initial_choice(
+    recorded: Option<String>,
+    reopened: bool,
+    initial_to: &str,
+) -> (Option<String>, bool) {
+    if recorded.is_some() {
+        return (recorded, false);
+    }
+    if reopened && is_ambiguous_name(initial_to) {
+        return (None, true);
+    }
+    (address_choice(initial_to), false)
+}
+
+/// Prefix of a recorded recipient address. What follows is the
+/// recipient's identity address (`freenet_mail_protocol::address::address_of`
+/// of their verifying key) in bs58. Unlike an inbox contract id it does not
+/// depend on the inbox contract's code, so it survives a new inbox
+/// generation.
+const RECIPIENT_PREFIX: &str = "fmail-addr:";
+
+/// A recipient's address, as a draft records it: the identity address of
+/// their verifying key. It names exactly one key, unlike an alias, and stays
+/// the same whichever inbox contract they are on; the inbox is resolved
+/// from the key at send time.
+pub fn recipient_address(recipient: &Recipient) -> String {
+    let addr = freenet_mail_protocol::address::address_of(&recipient.ml_dsa_vk_bytes);
+    format!("{RECIPIENT_PREFIX}{}", bs58::encode(addr.0).into_string())
+}
+
+/// What a recorded recipient address resolves to now.
+enum Recorded {
+    Found(Recipient),
+    /// More than one entry has this address's key (data from before each
+    /// key was kept unique): only the entry the user named can settle it.
+    Several(Vec<Recipient>),
+    /// A well-formed address that nobody in the address book has now.
+    Removed,
+    /// Not an address this build can resolve.
+    Unresolvable,
+}
+
+fn resolve_recorded(address: &str) -> Recorded {
+    let Some(encoded) = address.strip_prefix(RECIPIENT_PREFIX) else {
+        // Recorded by an earlier build as an inbox contract id, which
+        // resolves only while the recipient is still on the inbox it named.
+        return lookup_by_bs58(address).map_or(Recorded::Unresolvable, Recorded::Found);
+    };
+    let Some(addr) = bs58::decode(encoded)
+        .into_vec()
+        .ok()
+        .and_then(|b| <[u8; 24]>::try_from(b).ok())
+    else {
+        return Recorded::Unresolvable;
+    };
+    let mut found: Vec<Recipient> = ADDRESS_BOOK.with(|ab| {
+        ab.borrow()
+            .values()
+            .map(entry_to_recipient)
+            .filter(|r| freenet_mail_protocol::address::address_of(&r.ml_dsa_vk_bytes).0 == addr)
+            .collect()
+    });
+    found.dedup_by(|a, b| same_keys(a, b));
+    match found.len() {
+        0 => Recorded::Removed,
+        1 => Recorded::Found(found.remove(0)),
+        _ => Recorded::Several(found),
+    }
+}
+
+/// Whether two recipients have the same keys: the signing key AND the
+/// encryption key. A card can carry someone's signing key with another
+/// encryption key, so the signing key alone does not name a recipient.
+fn same_keys(a: &Recipient, b: &Recipient) -> bool {
+    a.ml_dsa_vk_bytes == b.ml_dsa_vk_bytes && a.ml_kem_ek_bytes == b.ml_kem_ek_bytes
+}
+
+/// The recipient to send to, given what the To field says (`typed`), the
+/// address recorded when the recipient was chosen (`chosen`), and whether
+/// the sheet is a reopened draft whose name is ambiguous and was not
+/// chosen again (`ambiguous`, see [`initial_choice`]). Mail goes to the
+/// recorded address and nowhere else: if `typed` has since come to name a
+/// different key (an identity created under a contact's name), or the
+/// recorded recipient is gone, the send is refused with a message saying
+/// so, and the user chooses again.
+pub fn resolve_for_send(
+    typed: &str,
+    chosen: Option<&str>,
+    ambiguous: bool,
+) -> Result<Recipient, String> {
+    let named = lookup(typed).or_else(|| lookup_by_bs58(typed));
+    match chosen {
+        Some(address) => {
+            let recorded = match resolve_recorded(address) {
+                Recorded::Found(r) => r,
+                // Settled by the entry the To field names, and only if it
+                // has exactly the keys of one of them.
+                Recorded::Several(all) => match &named {
+                    Some(now) if all.iter().any(|r| same_keys(r, now)) => now.clone(),
+                    _ => {
+                        return Err("More than one contact has the key this message was addressed to. Retype or pick the recipient you mean.".to_string());
+                    }
+                },
+                Recorded::Removed => {
+                    return Err("The recipient this message was addressed to is no longer in your address book. Choose the recipient again.".to_string());
+                }
+                Recorded::Unresolvable => {
+                    return Err("Couldn't work out who this message was addressed to. Choose the recipient again.".to_string());
+                }
+            };
+            match named {
+                Some(now) if !same_keys(&now, &recorded) => Err(format!(
+                    "\"{typed}\" now names a different key than the recipient this message was addressed to. Retype the recipient to choose again."
+                )),
+                _ => refuse_conflicting(recorded),
+            }
+        }
+        None if ambiguous => Err(format!(
+            "\"{typed}\" is ambiguous: a contact that used that name is now shown as {}. Retype or pick the recipient you mean.",
+            relabelled_from(typed).join(", ")
+        )),
+        None => named
+            .ok_or_else(|| {
+                format!(
+                    "Recipient `{typed}` is not in your address book. Import their contact before sending."
+                )
+            })
+            .and_then(refuse_conflicting),
+    }
+}
+
+/// Mail never goes to a signing key two contacts carry with different
+/// encryption keys: one card may be forged, and nothing says which.
+fn refuse_conflicting(recipient: Recipient) -> Result<Recipient, String> {
+    if key_conflict(&recipient.ml_dsa_vk_bytes) {
+        return Err("Two contacts have this recipient's signing key with different encryption keys, so one may be forged. Verify with them, then delete the wrong one in Contacts.".to_string());
+    }
+    Ok(recipient)
 }
 
 /// Bump the address-book generation so the bs58 lookup cache rebuilds on next
@@ -267,13 +478,41 @@ fn bump_address_book_gen() {
 
 /// Ensure an own `Identity` is registered.  Idempotent — a second call for
 /// the same alias updates the stored identity (covers the reload path).
+///
+/// Contacts and identities load in separate tasks, so a stored contact can
+/// take an alias before the identity of the same name arrives. The contact
+/// is never overwritten silently: it moves to its clash label
+/// (`alias~<address>`, as [`super::contact_store::disambiguate`] would have
+/// given it) and the user is told, whichever loaded first.
 pub fn register_identity(identity: &Identity) {
-    ADDRESS_BOOK.with(|ab| {
-        ab.borrow_mut().insert(
+    let moved = ADDRESS_BOOK.with(|ab| {
+        let mut ab = ab.borrow_mut();
+        let displaced = match ab.get(identity.alias.as_ref()) {
+            Some(Entry::Contact(c)) => Some(c.clone()),
+            _ => None,
+        };
+        let moved = displaced.map(|mut c| {
+            let original = c.local_alias.clone();
+            // Never onto an entry that already holds the clash label.
+            c.local_alias = free_label(&ab, super::contact_store::clash_label(&c));
+            note_relabelled(&c.local_alias, &original);
+            ab.insert(c.local_alias.to_string(), Entry::Contact(c));
+            original
+        });
+        ab.insert(
             identity.alias.to_string(),
             Entry::Own(Box::new(identity.clone())),
         );
+        moved
     });
+    if let Some(alias) = moved {
+        crate::toast::push_toast_detached(
+            format!(
+                "A contact shares the name \"{alias}\" with your identity. The contact is shown with the start of its address; rename it in Contacts."
+            ),
+            crate::toast::ToastLevel::Warning,
+        );
+    }
     bump_address_book_gen();
 }
 
@@ -285,17 +524,65 @@ pub fn register_identity(identity: &Identity) {
 /// Re-inserting a contact with the same alias and same fingerprint succeeds
 /// (allows overwrite of metadata like description / verified flag).
 pub fn insert_contact(contact: Contact) -> Result<(), String> {
+    insert(contact, false)
+}
+
+/// Add a contact the mail delegate already holds (the startup load). Unlike
+/// [`insert_contact`] it keeps a contact whose signing key another one
+/// shares: stored data must not vanish on load (which of the two survived
+/// would depend on load order). Two entries with one signing key and
+/// different encryption keys are a conflict that [`resolve_for_send`]
+/// refuses to send to until the user deletes one ([`key_conflict`]).
+pub fn load_contact(contact: Contact) -> Result<(), String> {
+    insert(contact, true)
+}
+
+/// Whether two contacts carry `vk` with different encryption keys: one of
+/// the cards may be forged, so neither is sent to.
+pub fn key_conflict(vk: &[u8]) -> bool {
+    ADDRESS_BOOK.with(|ab| {
+        let ab = ab.borrow();
+        let mut eks = ab.values().filter_map(|e| match e {
+            Entry::Contact(c) if c.ml_dsa_vk_bytes == vk => Some(&c.ml_kem_ek_bytes),
+            _ => None,
+        });
+        let first = eks.next();
+        eks.any(|ek| Some(ek) != first)
+    })
+}
+
+fn insert(contact: Contact, keep_shared_signing_key: bool) -> Result<(), String> {
     ADDRESS_BOOK
         .with(|ab| {
             let mut ab = ab.borrow_mut();
             // Self-import guard: enforced here so any caller path (UI form,
             // future API, test harness) gets the same protection.
-            for entry in ab.values() {
-                if let Entry::Own(id) = entry
-                    && id.ml_dsa_vk_bytes() == contact.ml_dsa_vk_bytes
-                    && id.ml_kem_ek_bytes() == contact.ml_kem_ek_bytes
-                {
-                    return Err("cannot import your own identity as a contact".into());
+            for (alias, entry) in ab.iter() {
+                match entry {
+                    Entry::Own(id) if id.ml_dsa_vk_bytes() == contact.ml_dsa_vk_bytes => {
+                        return Err(if id.ml_kem_ek_bytes() == contact.ml_kem_ek_bytes {
+                            "cannot import your own identity as a contact".into()
+                        } else {
+                            format!(
+                                "this card carries the signing key of your identity \"{alias}\" with a different encryption key; it was not imported"
+                            )
+                        });
+                    }
+                    // One entry per signing key: a second card with the same
+                    // key under another name would make which keys a
+                    // message goes to depend on the name typed, and a card
+                    // with a substituted encryption key could pass for the
+                    // real contact.
+                    Entry::Contact(c)
+                        if !keep_shared_signing_key
+                            && c.ml_dsa_vk_bytes == contact.ml_dsa_vk_bytes
+                            && *alias != *contact.local_alias =>
+                    {
+                        return Err(format!(
+                            "this contact is already in your address book as \"{alias}\"; update that entry instead"
+                        ));
+                    }
+                    _ => {}
                 }
             }
             if let Some(existing) = ab.get(contact.local_alias.as_ref()) {
@@ -330,8 +617,30 @@ pub fn insert_contact(contact: Contact) -> Result<(), String> {
         .inspect(|()| bump_address_book_gen())
 }
 
+/// What deleting the contact with signing key `vk` must do to the stored
+/// record, once it is gone from the address book. The delegate keeps one
+/// record per signing key, so when the deleted entry was one side of a key
+/// conflict the record is the KEPT entry's too: it is rewritten to the
+/// kept entry, not deleted (deleting it lost the kept contact on reload).
+pub enum PersistAfterRemoval {
+    Delete,
+    Rewrite(Contact),
+}
+
+pub fn persist_after_removal(vk: &[u8]) -> PersistAfterRemoval {
+    match all_contacts().into_iter().find(|c| c.ml_dsa_vk_bytes == vk) {
+        Some(kept) => PersistAfterRemoval::Rewrite(kept),
+        None => PersistAfterRemoval::Delete,
+    }
+}
+
 /// Remove a contact by alias.  No-op if the alias does not exist or is an
 /// own identity (own identities are never removed via this path).
+///
+/// Removing one of two contacts that clashed on a name leaves the name
+/// unambiguous: if exactly one contact is still shown under a clash label
+/// for it and nothing holds the bare name, that contact gets it back, as it
+/// would on the next load.
 pub fn remove_contact(alias: &str) {
     let removed = ADDRESS_BOOK.with(|ab| {
         let mut ab = ab.borrow_mut();
@@ -342,8 +651,110 @@ pub fn remove_contact(alias: &str) {
             false
         }
     });
-    if removed {
-        bump_address_book_gen();
+    if !removed {
+        return;
+    }
+    let original = RELABELLED.with(|r| r.borrow_mut().remove(alias));
+    if let Some(original) = original
+        && let [last] = relabelled_from(&original).as_slice()
+    {
+        ADDRESS_BOOK.with(|ab| {
+            let mut ab = ab.borrow_mut();
+            if ab.contains_key(original.as_ref()) {
+                return;
+            }
+            if let Some(Entry::Contact(mut c)) = ab.remove(last.as_str()) {
+                c.local_alias = original.clone();
+                ab.insert(original.to_string(), Entry::Contact(c));
+                RELABELLED.with(|r| r.borrow_mut().remove(last.as_str()));
+            }
+        });
+    }
+    bump_address_book_gen();
+}
+
+/// Re-key an own identity's entry after a rename: drop the entry under its
+/// old name (matched by keys, not name) and register it under the new one.
+/// Until this runs, the old name would still send to it and the new name
+/// would not resolve at all.
+pub fn rename_own_identity(identity: &Identity, new: &str) {
+    remove_own_identity(identity);
+    let mut renamed = identity.clone();
+    renamed.alias = std::rc::Rc::from(new);
+    register_identity(&renamed);
+}
+
+/// A contact with filler keys, for tests elsewhere in the crate.
+#[cfg(test)]
+pub(crate) fn contact_for_test(alias: &str, vk: u8) -> Contact {
+    Contact {
+        local_alias: alias.into(),
+        suggested_alias: None,
+        description: String::new(),
+        ml_dsa_vk_bytes: vec![vk; 1952],
+        ml_kem_ek_bytes: vec![vk; 1184],
+        required_tier: Tier::Day1,
+        max_age_secs: DEFAULT_MAX_AGE_SECS,
+        verified: false,
+        inbox_wasm_hash: None,
+    }
+}
+
+/// Whether `alias` names a contact (not one of the user's own identities):
+/// renaming an identity onto it would leave two entries answering to it.
+pub fn is_contact_name(alias: &str) -> bool {
+    ADDRESS_BOOK.with(|ab| {
+        ab.borrow()
+            .get(alias)
+            .is_some_and(|e| matches!(e, Entry::Contact(_)))
+    })
+}
+
+/// Remove an own identity's entry (it was deleted), matched by its keys, not
+/// its name. Until this runs, typing its name would still send to an inbox
+/// nobody can read any more.
+pub fn remove_own_identity(identity: &Identity) {
+    ADDRESS_BOOK.with(|ab| {
+        ab.borrow_mut().retain(|_, e| {
+            !matches!(e, Entry::Own(id) if id.ml_dsa_vk_bytes() == identity.ml_dsa_vk_bytes())
+        })
+    });
+    bump_address_book_gen();
+}
+
+/// The `Recipient` an address-book entry sends to.
+fn entry_to_recipient(entry: &Entry) -> Recipient {
+    match entry {
+        Entry::Own(id) => {
+            let ml_dsa_vk_bytes = id.ml_dsa_vk_bytes();
+            let ml_kem_ek_bytes = id.ml_kem_ek_bytes();
+            let fingerprint = fingerprint_words(&ml_dsa_vk_bytes, &ml_kem_ek_bytes);
+            Recipient {
+                local_alias: id.alias.clone(),
+                ml_dsa_vk_bytes,
+                ml_kem_ek_bytes,
+                fingerprint,
+                required_tier: id.required_tier,
+                max_age_secs: id.max_age_secs,
+                verified: true,
+                is_own: true,
+                inbox_wasm_hash: None,
+            }
+        }
+        Entry::Contact(c) => {
+            let fingerprint = c.fingerprint();
+            Recipient {
+                local_alias: c.local_alias.clone(),
+                ml_dsa_vk_bytes: c.ml_dsa_vk_bytes.clone(),
+                ml_kem_ek_bytes: c.ml_kem_ek_bytes.clone(),
+                fingerprint,
+                required_tier: c.required_tier,
+                max_age_secs: c.max_age_secs,
+                verified: c.verified,
+                is_own: false,
+                inbox_wasm_hash: c.inbox_wasm_hash.clone(),
+            }
+        }
     }
 }
 
@@ -356,56 +767,29 @@ pub fn remove_contact(alias: &str) {
 /// sender shared. Exact local-alias matches always win, so relabelling
 /// is never shadowed by someone else's suggested alias.
 pub fn lookup(alias: &str) -> Option<Recipient> {
-    fn entry_to_recipient(entry: &Entry) -> Recipient {
-        match entry {
-            Entry::Own(id) => {
-                let ml_dsa_vk_bytes = id.ml_dsa_vk_bytes();
-                let ml_kem_ek_bytes = id.ml_kem_ek_bytes();
-                let fingerprint = fingerprint_words(&ml_dsa_vk_bytes, &ml_kem_ek_bytes);
-                Recipient {
-                    local_alias: id.alias.clone(),
-                    ml_dsa_vk_bytes,
-                    ml_kem_ek_bytes,
-                    fingerprint,
-                    required_tier: id.required_tier,
-                    max_age_secs: id.max_age_secs,
-                    verified: true,
-                    is_own: true,
-                    inbox_wasm_hash: None,
-                }
-            }
-            Entry::Contact(c) => {
-                let fingerprint = c.fingerprint();
-                Recipient {
-                    local_alias: c.local_alias.clone(),
-                    ml_dsa_vk_bytes: c.ml_dsa_vk_bytes.clone(),
-                    ml_kem_ek_bytes: c.ml_kem_ek_bytes.clone(),
-                    fingerprint,
-                    required_tier: c.required_tier,
-                    max_age_secs: c.max_age_secs,
-                    verified: c.verified,
-                    is_own: false,
-                    inbox_wasm_hash: c.inbox_wasm_hash.clone(),
-                }
-            }
-        }
-    }
-
     ADDRESS_BOOK.with(|ab| {
         let ab = ab.borrow();
         // Exact local-alias / own-identity-alias match wins.
         if let Some(entry) = ab.get(alias) {
             return Some(entry_to_recipient(entry));
         }
-        // Fallback: a contact whose sender-advertised suggested_alias
+        // Fallback: the one contact whose sender-advertised suggested_alias
         // matches. Only contacts carry a suggested_alias, so this never
-        // collides with an own identity.
-        ab.values().find_map(|entry| match entry {
-            Entry::Contact(c) if c.suggested_alias.as_deref() == Some(alias) => {
-                Some(entry_to_recipient(entry))
+        // collides with an own identity. A contact moved to a clash label
+        // lost the bare alias because it is ambiguous, and two contacts
+        // advertising the same name are ambiguous too: neither resolves
+        // it, or mail could go to whichever matched first.
+        let mut matches = ab.values().filter(|entry| match entry {
+            Entry::Contact(c) => {
+                c.suggested_alias.as_deref() == Some(alias) && !is_relabelled(&c.local_alias)
             }
-            _ => None,
-        })
+            Entry::Own(_) => false,
+        });
+        let only = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(entry_to_recipient(only))
     })
 }
 
@@ -628,6 +1012,7 @@ pub fn contact_by_vk(vk_bytes: &[u8]) -> Option<Contact> {
 #[cfg(test)]
 pub fn clear_for_test() {
     ADDRESS_BOOK.with(|ab| ab.borrow_mut().clear());
+    RELABELLED.with(|r| r.borrow_mut().clear());
     bump_address_book_gen();
 }
 
@@ -730,25 +1115,6 @@ pub fn vk_from_bytes(bytes: &[u8]) -> Result<MlDsaVerifyingKey<MlDsa65>, String>
 
 // ── Migration scaffolding ─────────────────────────────────────────────────────
 
-/// Hashes of identity-management delegate wasm builds that pre-date this
-/// release. Empty for now — no production data existed before v1. Populate
-/// when a future breaking change bumps the wasm hash again, so the next
-/// release can find and migrate identities stored under the prior hash.
-pub const LEGACY_ID_DELEGATE_HASHES: &[&str] = &[];
-
-/// Walk `LEGACY_ID_DELEGATE_HASHES` and copy entries from any legacy delegate
-/// into the current one. Wired into the app startup path; currently a
-/// no-op because the slice is empty. When future hashes are added, the
-/// implementation should issue a `GetIdentities` request per legacy hash
-/// and, on response, re-issue `CreateIdentity` against the current
-/// delegate for each entry found.
-pub fn migrate_legacy_identities() {
-    for _hash in LEGACY_ID_DELEGATE_HASHES {
-        // Placeholder: issue GetIdentities to the legacy delegate and
-        // upsert results into the current delegate.
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -759,8 +1125,7 @@ mod tests {
     /// would otherwise persist across tests. A bare `ADDRESS_BOOK.clear()`
     /// alone leaves the cache stale.
     fn reset_address_book() {
-        ADDRESS_BOOK.with(|ab| ab.borrow_mut().clear());
-        bump_address_book_gen();
+        clear_for_test();
     }
 
     #[test]
@@ -907,6 +1272,59 @@ mod tests {
         assert!(err.contains("different contact"), "got: {err}");
     }
 
+    /// A forged card with a known contact's signing key and another
+    /// encryption key, under a new name, is refused: one entry per signing
+    /// key, so which keys a message goes to can never depend on the name.
+    #[test]
+    fn a_second_contact_with_a_stored_signing_key_is_refused() {
+        reset_address_book();
+        insert_contact(make_contact("dupvk-bob", 41, 2)).unwrap();
+        let err = insert_contact(make_contact("dupvk-bob2", 41, 9)).unwrap_err();
+        assert!(err.contains("already in your address book"), "got: {err}");
+        let err = insert_contact(make_contact("dupvk-bob3", 41, 2)).unwrap_err();
+        assert!(err.contains("\"dupvk-bob\""), "got: {err}");
+        // Updating the existing entry still works.
+        insert_contact(make_contact("dupvk-bob", 41, 2)).unwrap();
+    }
+
+    /// Two entries with one signing key and different encryption keys (data
+    /// from before keys were kept unique, or a forged card): a draft recorded
+    /// for that key goes to neither, whichever name the To field holds,
+    /// since nothing says which card is real. Same keys under two names
+    /// are not a conflict.
+    #[test]
+    fn a_recorded_key_shared_by_two_entries_is_held_until_resolved() {
+        reset_address_book();
+        let real = make_contact("shared-bob", 42, 2);
+        let forged = make_contact("shared-bob2", 42, 9);
+        ADDRESS_BOOK.with(|ab| {
+            let mut ab = ab.borrow_mut();
+            ab.insert("shared-bob".into(), Entry::Contact(real.clone()));
+            ab.insert("shared-bob2".into(), Entry::Contact(forged));
+        });
+        bump_address_book_gen();
+        // Both names record the same address (it derives from the signing
+        // key alone); neither may be sent to while the cards disagree.
+        let chosen = recipient_address(&lookup("shared-bob").unwrap());
+        for typed in ["shared-bob", "shared-bob2"] {
+            let err = resolve_for_send(typed, Some(&chosen), false).unwrap_err();
+            assert!(err.contains("may be forged"), "{typed}: {err}");
+        }
+        // Naming neither settles nothing.
+        assert!(resolve_for_send("someone-else", Some(&chosen), false).is_err());
+        // The same keys under a second name are no conflict.
+        ADDRESS_BOOK.with(|ab| {
+            ab.borrow_mut().remove("shared-bob2");
+            ab.borrow_mut().insert(
+                "shared-bob-too".into(),
+                Entry::Contact(make_contact("shared-bob-too", 42, 2)),
+            );
+        });
+        bump_address_book_gen();
+        let r = resolve_for_send("shared-bob", Some(&chosen), false).unwrap();
+        assert_eq!(r.ml_kem_ek_bytes, real.ml_kem_ek_bytes);
+    }
+
     fn make_contact_suggested(local: &str, suggested: Option<&str>, vk: u8, ek: u8) -> Contact {
         Contact {
             suggested_alias: suggested.map(Rc::from),
@@ -965,6 +1383,340 @@ mod tests {
         assert!(lookup("anything-else").is_none());
     }
 
+    fn own_identity(alias: &str) -> Identity {
+        let info = freenet_mail_protocol::IdentityInfo {
+            addr: freenet_mail_protocol::Addr([0x77; 24]),
+            vk: Vec::new().into(),
+            ek: Vec::new().into(),
+            alias: alias.to_string(),
+            description: String::new(),
+            confirmed: true,
+            generation: 1,
+        };
+        Identity::from_info(&info, crate::app::UserId::new())
+    }
+
+    /// A contact with a real verifying key, so its inbox address derives.
+    fn real_contact(alias: &str, seed: u8) -> Contact {
+        Contact {
+            ml_dsa_vk_bytes: crate::test_util::real_vk_bytes(seed),
+            ..make_contact(alias, 0, seed)
+        }
+    }
+
+    /// An identity with a real verifying key.
+    fn real_own_identity(alias: &str, seed: u8) -> Identity {
+        let info = freenet_mail_protocol::IdentityInfo {
+            addr: freenet_mail_protocol::Addr([seed; 24]),
+            vk: crate::test_util::real_vk_bytes(seed).into(),
+            ek: vec![seed; 1184].into(),
+            alias: alias.to_string(),
+            description: String::new(),
+            confirmed: true,
+            generation: 1,
+        };
+        Identity::from_info(&info, crate::app::UserId::new())
+    }
+
+    /// A draft addressed to contact "alice" must not go to your own
+    /// identity once one takes the name "alice": the draft recorded the
+    /// contact's address, and the send is refused with a message instead of
+    /// silently routing elsewhere.
+    #[test]
+    fn a_draft_for_a_contact_is_not_sent_to_an_identity_that_took_its_name() {
+        reset_address_book();
+        insert_contact(real_contact("rfs-alice", 21)).unwrap();
+        let chosen = address_choice("rfs-alice").expect("the contact resolves to an address");
+        assert_eq!(
+            resolve_for_send("rfs-alice", Some(&chosen), false).map(|r| r.is_own),
+            Ok(false)
+        );
+
+        // An identity named "rfs-alice" arrives; the contact is relabelled.
+        register_identity(&real_own_identity("rfs-alice", 22));
+        let err = resolve_for_send("rfs-alice", Some(&chosen), false).unwrap_err();
+        assert!(err.contains("now names a different key"), "got: {err}");
+
+        // Choosing the contact again by its label goes to the contact.
+        let label = relabelled_from("rfs-alice")
+            .pop()
+            .expect("the contact was relabelled");
+        let again = address_choice(&label).expect("the label resolves");
+        assert_eq!(again, chosen, "same contact, same address");
+        let r = resolve_for_send(&label, Some(&again), false).unwrap();
+        assert!(!r.is_own);
+    }
+
+    /// An older draft with no recorded address whose name became ambiguous
+    /// is not resolved to a guess: the user is asked to choose.
+    #[test]
+    fn an_unaddressed_draft_with_an_ambiguous_name_asks_the_user() {
+        reset_address_book();
+        insert_contact(real_contact("amb-bob", 31)).unwrap();
+        register_identity(&real_own_identity("amb-bob", 32));
+        let (chosen, ambiguous) = initial_choice(None, true, "amb-bob");
+        assert_eq!(chosen, None, "nothing is recorded for it");
+        assert!(ambiguous);
+        let err = resolve_for_send("amb-bob", None, ambiguous).unwrap_err();
+        assert!(err.contains("ambiguous"), "got: {err}");
+
+        // A fresh compose prefilled with the name is not a reopened draft:
+        // the name is chosen now, and means the entry that holds it.
+        let (chosen, ambiguous) = initial_choice(None, false, "amb-bob");
+        assert!(chosen.is_some() && !ambiguous);
+    }
+
+    /// Typing or picking a name means the entry that holds it now, even if a
+    /// contact was moved off that name: your own identity that took a
+    /// contact's name can be written to.
+    #[test]
+    fn a_typed_name_an_identity_took_from_a_contact_is_sendable() {
+        reset_address_book();
+        insert_contact(real_contact("took-bob", 51)).unwrap();
+        register_identity(&real_own_identity("took-bob", 52));
+        assert!(is_ambiguous_name("took-bob"), "a contact was moved off it");
+        let chosen = address_choice("took-bob").expect("the typed name is chosen");
+        let r = resolve_for_send("took-bob", Some(&chosen), false).unwrap();
+        assert!(r.is_own, "it goes to the identity that holds the name");
+        let r = resolve_for_send("took-bob", None, false).unwrap();
+        assert!(r.is_own);
+    }
+
+    /// Two contacts that clashed on a name were both moved off it; a new
+    /// contact given that name afterwards can be sent to by it.
+    #[test]
+    fn a_new_contact_reusing_a_clashed_name_is_sendable() {
+        reset_address_book();
+        let (contacts, clashed) = crate::app::contact_store::disambiguate(
+            vec![real_contact("re-bob", 61), real_contact("re-bob", 62)],
+            |_| false,
+        );
+        assert_eq!(clashed, vec!["re-bob".to_string()]);
+        for c in contacts {
+            insert_contact(c).unwrap();
+        }
+        let fresh = real_contact("re-bob", 63);
+        let fresh_vk = fresh.ml_dsa_vk_bytes.clone();
+        insert_contact(fresh).unwrap();
+        let chosen = address_choice("re-bob").expect("the new contact is chosen");
+        let r = resolve_for_send("re-bob", Some(&chosen), false).unwrap();
+        assert_eq!(r.ml_dsa_vk_bytes, fresh_vk, "it goes to the new contact");
+    }
+
+    /// A draft records the recipient's key, not their inbox contract: the
+    /// same contact on a different inbox contract code (a new inbox
+    /// generation) is still the recorded recipient.
+    #[test]
+    fn a_recorded_recipient_survives_a_change_of_inbox_contract() {
+        reset_address_book();
+        let on_old = Contact {
+            inbox_wasm_hash: Some(crate::inbox::LEGACY_INBOX_CODE_HASHES[0].to_string()),
+            ..real_contact("gen-erin", 71)
+        };
+        insert_contact(on_old.clone()).unwrap();
+        let chosen = address_choice("gen-erin").unwrap();
+        // The contact re-imported on the current inbox contract.
+        insert_contact(Contact {
+            inbox_wasm_hash: None,
+            ..on_old.clone()
+        })
+        .unwrap();
+        let r = resolve_for_send("gen-erin", Some(&chosen), false)
+            .expect("the recorded recipient still resolves");
+        assert_eq!(r.ml_dsa_vk_bytes, on_old.ml_dsa_vk_bytes);
+        assert_eq!(r.inbox_wasm_hash, None, "sent to their current inbox");
+    }
+
+    /// Removing one of two contacts that clashed on a name gives the other
+    /// its name back, without a reload.
+    #[test]
+    fn removing_one_of_two_clashed_contacts_frees_the_name() {
+        reset_address_book();
+        let (contacts, _) = crate::app::contact_store::disambiguate(
+            vec![real_contact("two-gil", 91), real_contact("two-gil", 92)],
+            |_| false,
+        );
+        let labels: Vec<String> = contacts.iter().map(|c| c.local_alias.to_string()).collect();
+        let kept_vk = contacts[1].ml_dsa_vk_bytes.clone();
+        for c in contacts {
+            insert_contact(c).unwrap();
+        }
+        assert!(is_ambiguous_name("two-gil"));
+        remove_contact(&labels[0]);
+        assert!(!is_ambiguous_name("two-gil"), "one contact is left");
+        let r = lookup("two-gil").expect("the remaining contact has the name back");
+        assert_eq!(r.ml_dsa_vk_bytes, kept_vk);
+        assert!(lookup(&labels[1]).is_none(), "its clash label is gone");
+
+        // With an identity holding the name, the contact keeps its label.
+        reset_address_book();
+        let (contacts, _) = crate::app::contact_store::disambiguate(
+            vec![real_contact("idg", 93), real_contact("idg", 94)],
+            |_| false,
+        );
+        let first = contacts[0].local_alias.to_string();
+        for c in contacts {
+            insert_contact(c).unwrap();
+        }
+        register_identity(&real_own_identity("idg", 95));
+        remove_contact(&first);
+        assert_eq!(entry_is_own("idg"), Some(true), "the identity keeps it");
+    }
+
+    /// A clash label never lands on a name another stored contact has, so
+    /// no contact is dropped when the labelled ones are inserted.
+    #[test]
+    fn a_clash_label_never_collides_with_another_stored_contact() {
+        reset_address_book();
+        let a = real_contact("col-hal", 101);
+        let label = crate::app::contact_store::clash_label(&a).to_string();
+        let squatter = real_contact(&label, 102);
+        let (contacts, _) = crate::app::contact_store::disambiguate(
+            vec![a, real_contact("col-hal", 103), squatter],
+            |_| false,
+        );
+        for c in contacts {
+            insert_contact(c).expect("every stored contact is inserted");
+        }
+        assert_eq!(entry_is_own(&label), Some(false));
+        assert_eq!(
+            ADDRESS_BOOK.with(|ab| ab.borrow().len()),
+            3,
+            "all three contacts are in the address book"
+        );
+    }
+
+    /// "Removed" and "can't resolve" are told apart.
+    #[test]
+    fn an_unresolvable_recorded_recipient_says_so() {
+        reset_address_book();
+        insert_contact(real_contact("bad-fay", 81)).unwrap();
+        let err = resolve_for_send("bad-fay", Some("fmail-addr:not-bs58!"), false).unwrap_err();
+        assert!(err.contains("Couldn't work out"), "got: {err}");
+        let err = resolve_for_send("bad-fay", Some("fmail-addr:2"), false).unwrap_err();
+        assert!(err.contains("Couldn't work out"), "a short address: {err}");
+    }
+
+    /// A recorded recipient that has since been removed is refused, not
+    /// replaced by whoever now has the name.
+    #[test]
+    fn a_removed_recorded_recipient_is_refused() {
+        reset_address_book();
+        insert_contact(real_contact("gone-carol", 41)).unwrap();
+        let chosen = address_choice("gone-carol").unwrap();
+        remove_contact("gone-carol");
+        insert_contact(real_contact("gone-carol", 42)).unwrap();
+        let err = resolve_for_send("gone-carol", Some(&chosen), false).unwrap_err();
+        assert!(err.contains("no longer in your address book"), "got: {err}");
+    }
+
+    /// Moving a contact to its clash label never overwrites whatever holds
+    /// that label already.
+    #[test]
+    fn a_clash_label_never_overwrites_an_existing_entry() {
+        reset_address_book();
+        let contact = make_contact("lbl-dan", 5, 6);
+        let label = crate::app::contact_store::clash_label(&contact);
+        // Something already holds the clash label.
+        insert_contact(make_contact(&label, 7, 8)).unwrap();
+        insert_contact(contact).unwrap();
+        register_identity(&own_identity("lbl-dan"));
+        let holder = ADDRESS_BOOK.with(|ab| match ab.borrow().get(label.as_ref()) {
+            Some(Entry::Contact(c)) => Some(c.ml_dsa_vk_bytes[0]),
+            _ => None,
+        });
+        assert_eq!(holder, Some(7), "the existing entry keeps the label");
+        let moved = relabelled_from("lbl-dan");
+        assert_eq!(moved, vec![format!("{label}-2")]);
+        assert_eq!(entry_is_own(&moved[0]), Some(false));
+    }
+
+    fn entry_is_own(alias: &str) -> Option<bool> {
+        ADDRESS_BOOK.with(|ab| ab.borrow().get(alias).map(|e| matches!(e, Entry::Own(_))))
+    }
+
+    /// Contacts and identities load in separate tasks. Whichever arrives
+    /// first, an identity and a stored contact sharing an alias both stay
+    /// in the address book: the identity has the bare alias, and the contact
+    /// moves to its clash label rather than being silently overwritten.
+    #[test]
+    fn an_identity_arriving_after_a_same_named_contact_does_not_drop_it() {
+        reset_address_book();
+        let contact = make_contact("clash-alice", 5, 6);
+        let label = crate::app::contact_store::clash_label(&contact);
+        insert_contact(contact).unwrap();
+        register_identity(&own_identity("clash-alice"));
+        assert_eq!(entry_is_own("clash-alice"), Some(true));
+        assert_eq!(
+            entry_is_own(&label),
+            Some(false),
+            "the contact is kept, under its clash label"
+        );
+
+        // Identity first, then the contact: the load's `disambiguate` sees
+        // the identity and labels the contact the same way.
+        reset_address_book();
+        register_identity(&own_identity("clash-alice"));
+        let (contacts, clashed) = crate::app::contact_store::disambiguate(
+            vec![make_contact("clash-alice", 5, 6)],
+            |alias| entry_is_own(alias) == Some(true),
+        );
+        assert_eq!(clashed, vec!["clash-alice".to_string()]);
+        for c in contacts {
+            insert_contact(c).unwrap();
+        }
+        assert_eq!(entry_is_own("clash-alice"), Some(true));
+        assert_eq!(entry_is_own(&label), Some(false));
+    }
+
+    /// A contact moved to its clash label lost the bare alias because it is
+    /// ambiguous; the suggested-alias fallback must not hand that alias back
+    /// to it, and two contacts advertising one name resolve to neither.
+    #[test]
+    fn the_suggested_alias_fallback_never_resolves_an_ambiguous_alias() {
+        reset_address_book();
+        let relabelled = Contact {
+            local_alias: "bob~0a0b0c".into(),
+            ..make_contact_suggested("x", Some("bob"), 1, 2)
+        };
+        insert_contact(relabelled).unwrap();
+        note_relabelled("bob~0a0b0c", "bob");
+        assert!(
+            lookup("bob").is_none(),
+            "a relabelled contact does not get its bare alias back"
+        );
+
+        // A contact the user deliberately named with a `~` is not a clash
+        // label, so its suggested alias still resolves.
+        reset_address_book();
+        let named = Contact {
+            local_alias: "bob~work".into(),
+            ..make_contact_suggested("x", Some("bob"), 1, 2)
+        };
+        insert_contact(named).unwrap();
+        assert_eq!(
+            lookup("bob").map(|r| r.local_alias.to_string()).as_deref(),
+            Some("bob~work"),
+            "a `~` in a name the user chose is not a relabel"
+        );
+
+        reset_address_book();
+        insert_contact(make_contact_suggested("bob-one", Some("bob"), 1, 2)).unwrap();
+        insert_contact(make_contact_suggested("bob-two", Some("bob"), 3, 4)).unwrap();
+        assert!(
+            lookup("bob").is_none(),
+            "two contacts suggest it: neither wins"
+        );
+
+        reset_address_book();
+        insert_contact(make_contact_suggested("bob-one", Some("bob"), 1, 2)).unwrap();
+        assert_eq!(
+            lookup("bob").map(|r| r.local_alias.to_string()).as_deref(),
+            Some("bob-one"),
+            "a single unambiguous suggestion still resolves"
+        );
+    }
+
     #[test]
     fn insert_contact_rejects_alias_with_different_ek() {
         // Same VK but a substituted EK must also be rejected, otherwise an
@@ -975,6 +1727,51 @@ mod tests {
         let err = insert_contact(make_contact("alice", 4, 9))
             .expect_err("different EK should be rejected");
         assert!(err.contains("different contact"), "got: {err}");
+    }
+
+    /// Contacts the delegate holds that share a signing key with different
+    /// encryption keys (data from before each key was kept unique, or a
+    /// forged card) are both kept on load, whatever their order, and mail
+    /// to that key is refused until one is deleted.
+    #[test]
+    fn stored_contacts_sharing_a_signing_key_are_kept_and_held() {
+        for order in [["bob", "bob2"], ["bob2", "bob"]] {
+            reset_address_book();
+            for alias in order {
+                let ek = if alias == "bob" { 5 } else { 9 };
+                load_contact(make_contact(alias, 4, ek)).unwrap();
+            }
+            assert!(lookup("bob").is_some() && lookup("bob2").is_some());
+            let real = lookup("bob").unwrap();
+            assert!(key_conflict(&real.ml_dsa_vk_bytes));
+            // Neither by name, nor by an address recorded earlier.
+            let chosen = recipient_address(&real);
+            for (typed, chosen) in [
+                ("bob", None),
+                ("bob2", None),
+                ("bob", Some(chosen.as_str())),
+            ] {
+                let err = resolve_for_send(typed, chosen, false).unwrap_err();
+                assert!(err.contains("may be forged"), "{typed}: {err}");
+            }
+            // Resolved by deleting the wrong one.
+            remove_contact("bob2");
+            assert!(!key_conflict(&real.ml_dsa_vk_bytes));
+            assert!(resolve_for_send("bob", None, false).is_ok());
+            // The one stored record (one per signing key) is rewritten to
+            // the kept entry, not deleted with the other (round-8 X4).
+            match persist_after_removal(&real.ml_dsa_vk_bytes) {
+                PersistAfterRemoval::Rewrite(kept) => {
+                    assert_eq!(&*kept.local_alias, "bob");
+                    assert_eq!(kept.ml_kem_ek_bytes, real.ml_kem_ek_bytes);
+                }
+                PersistAfterRemoval::Delete => panic!("the kept contact's record was deleted"),
+            }
+        }
+        // A new import still refuses a second entry for one signing key.
+        reset_address_book();
+        insert_contact(make_contact("bob", 4, 5)).unwrap();
+        assert!(insert_contact(make_contact("bob2", 4, 9)).is_err());
     }
 
     #[test]

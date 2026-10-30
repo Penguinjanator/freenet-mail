@@ -1,4 +1,12 @@
-import { test, expect, type FrameLocator } from "@playwright/test";
+import {
+  test,
+  expect,
+  type Browser,
+  type BrowserContext,
+  type FrameLocator,
+  type Page,
+  type TestInfo,
+} from "@playwright/test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { APP_NAME } from "./app-name";
@@ -48,11 +56,11 @@ const PEER_BASE_URL = CONTRACT_ID
 
 // Iso harness wipes state per make-task invocation, but Playwright
 // retries reuse the same iso net — second attempt collides with the
-// first run's AFT slot / identity-management state. Keep this spec
+// first run's AFT slot / mail-delegate state. Keep this spec
 // single-shot; flake is a real bug, not a transient.
 test.describe.configure({ retries: 0 });
 
-// Each test gets unique alias names so identity-management delegate
+// Each test gets unique alias names so mail-delegate
 // state on the gw (and peer) doesn't collide across tests in the same
 // run. The harness wipes once at the start of `cargo make
 // test-e2e-real-node`, but the 3 specs run sequentially against the
@@ -86,6 +94,101 @@ const ALIAS_T10_BOB = "bob10";
 // already cached this inbox from an earlier test (which would mask the
 // subscribe-before-get bug — the contract would already be locally held).
 const ALIAS_T11_BOB = "bob11";
+type Evidence = {
+  newContext: Browser["newContext"];
+  contexts: BrowserContext[];
+  lines: string[];
+  // Taken when a context closes: tests close theirs in `finally`, before
+  // `afterEach` can look at a page. Written out only if the test failed.
+  snapshots: { name: string; body: string | Buffer; contentType: string }[];
+};
+const EVIDENCE = new WeakMap<Browser, Evidence>();
+
+async function snapshotPages(ctx: BrowserContext, label: string, ev: Evidence) {
+  for (const [j, page] of ctx.pages().entries()) {
+    if (page.isClosed()) continue;
+    const name = `${label}-page${j}`;
+    const shot = await page.screenshot({ fullPage: true }).catch(() => null);
+    if (shot) ev.snapshots.push({ name: `${name}.png`, body: shot, contentType: "image/png" });
+    const app = await page
+      .$("iframe#app")
+      .then((el) => el?.contentFrame() ?? null)
+      .catch(() => null);
+    const html = await (app ?? page.mainFrame()).content().catch(() => null);
+    if (html) ev.snapshots.push({ name: `${name}.html`, body: html, contentType: "text/html" });
+  }
+}
+
+function watchContext(ctx: BrowserContext, ev: Evidence) {
+  const label = `ctx${ev.contexts.length}`;
+  ev.contexts.push(ctx);
+  const close = ctx.close.bind(ctx);
+  ctx.close = async (options) => {
+    await snapshotPages(ctx, label, ev);
+    return close(options);
+  };
+  const watchPage = (p: Page) => {
+    p.on("console", (m) =>
+      ev.lines.push(`[${label}:${m.type()}] ${m.text()}`),
+    );
+    p.on("pageerror", (e) => ev.lines.push(`[${label}:pageerror] ${e.message}`));
+    // A page that restarts mid-test loses its in-memory state; these say why.
+    p.on("framenavigated", (f) =>
+      ev.lines.push(
+        `[${label}:navigated] ${f === p.mainFrame() ? "top" : "frame"} ${f.url()}`,
+      ),
+    );
+    p.on("crash", () => ev.lines.push(`[${label}:crash]`));
+    // A dialog listener turns off Playwright's own handling, so do what it
+    // does: let a leave-page prompt through and dismiss anything else.
+    p.on("dialog", (d) => {
+      ev.lines.push(`[${label}:dialog] ${d.type()} ${d.message()}`);
+      void (d.type() === "beforeunload" ? d.accept() : d.dismiss()).catch(() => {});
+    });
+    p.on("close", () => ev.lines.push(`[${label}:close]`));
+  };
+  ctx.pages().forEach(watchPage);
+  ctx.on("page", watchPage);
+}
+
+async function recordEvidence(browser: Browser, context: BrowserContext) {
+  const ev: Evidence = {
+    newContext: browser.newContext.bind(browser),
+    contexts: [],
+    lines: [],
+    snapshots: [],
+  };
+  EVIDENCE.set(browser, ev);
+  watchContext(context, ev);
+  browser.newContext = async (options) => {
+    const ctx = await ev.newContext(options);
+    watchContext(ctx, ev);
+    return ctx;
+  };
+}
+
+async function attachEvidence(browser: Browser, testInfo: TestInfo) {
+  const ev = EVIDENCE.get(browser);
+  if (!ev) return;
+  browser.newContext = ev.newContext;
+  EVIDENCE.delete(browser);
+  if (testInfo.status === testInfo.expectedStatus) return;
+  // Written as files: test-results/ is uploaded, and an attachment with only
+  // a body is kept by a reporter, which CI does not upload.
+  const keep = async (name: string, body: string | Buffer, contentType: string) => {
+    const file = testInfo.outputPath(name);
+    fs.writeFileSync(file, body);
+    await testInfo.attach(name, { path: file, contentType });
+  };
+  for (const [i, ctx] of ev.contexts.entries()) {
+    await snapshotPages(ctx, `ctx${i}`, ev);
+  }
+  for (const snap of ev.snapshots) await keep(snap.name, snap.body, snap.contentType);
+  await keep("console.txt", ev.lines.join("\n"), "text/plain");
+  console.log(`── console of failed test "${testInfo.title}" ──`);
+  for (const line of ev.lines) console.log(line);
+}
+
 test.describe("Live node E2E", () => {
   test.skip(
     !process.env.FREENET_EMAIL_BASE_URL?.includes("/v1/contract/web/"),
@@ -99,7 +202,7 @@ test.describe("Live node E2E", () => {
   // skip is keyed on project name and resolved per-test (not via a
   // beforeAll), so running the full suite without `--project=chromium`
   // does not trip a beforeEach against an unreachable gateway.
-  test.beforeEach(async ({}, testInfo) => {
+  test.beforeEach(async ({ browser, context }, testInfo) => {
     test.skip(
       testInfo.project.name !== "chromium",
       "live-node spec runs on chromium only",
@@ -107,6 +210,14 @@ test.describe("Live node E2E", () => {
     // Sanity: gateway permission API reachable from test runner.
     const res = await fetch(`${ISO_GW_ORIGIN}/permission/pending`);
     expect(res.ok, "iso gateway /permission/pending must respond").toBe(true);
+    await recordEvidence(browser, context);
+  });
+
+  // A failure that only happens in CI leaves nothing to diagnose unless every
+  // page's console, a screenshot and the app's DOM are kept. This suite runs
+  // with retries: 0, so the config's `trace: "on-first-retry"` never fires.
+  test.afterEach(async ({ browser }, testInfo) => {
+    await attachEvidence(browser, testInfo);
   });
 
   test("create identity → reload persists → drives permission flow", async ({
@@ -165,21 +276,38 @@ test.describe("Live node E2E", () => {
         "identity persists across reload",
       ).toBeVisible({ timeout: 30_000 });
 
-      // ── Step 3: assert delegate registered + Init idempotent ──────
-      // PR #34 fix: Init must skip if secret already exists. Probe via
-      // gateway log.
+      // ── Step 3: the identity was created by the mail delegate ─────
+      // The page holds no seeds, so the identity that survived the reload
+      // above can only live in the unified mail delegate. Prove that
+      // delegate's own code ran on this node: the first time a node runs a
+      // delegate it compiles the module and logs "Module cache miss —
+      // compiling" with the code hash (info level, freenet >= 0.2.151).
+      // Fresh iso nodes start with an empty module cache, so the line is
+      // always there, and it names exactly the candidate the UI embeds.
+      // (A UI `log::info` line would not do: in the browser it goes to the
+      // console only, never to the gateway log.)
+      const candidateHash = fs
+        .readFileSync(
+          path.join(
+            __dirname,
+            "..",
+            "..",
+            "published-contract",
+            "candidate",
+            "mail_delegate_code_hash",
+          ),
+          "utf8",
+        )
+        .trim();
+      expect(candidateHash, "candidate code hash is committed").not.toBe("");
       await expect
         .poll(
           () =>
-            grepLog(
-              new RegExp(
-                `create alias .*${ALIAS_T1_ALICE}|set_aliases count=\\d+|init skipped — secret already exists`,
-              ),
-            ),
+            logHasLineWith(GW_LOG_DIR, ["Module cache miss", candidateHash]),
           {
             message:
-              "expected gateway log to show identity-management activity " +
-              "(create alias / set_aliases / init-skip)",
+              "expected the gateway to compile and run the mail delegate " +
+              `(code hash ${candidateHash})`,
             timeout: 30_000,
           },
         )
@@ -309,7 +437,7 @@ test.describe("Live node E2E", () => {
 
   // Cross-node send: alice on gw (7510), bob on peer (7511). Each
   // Cross-node send + receive end-to-end. Each node has its own
-  // identity-management delegate state, so bob's keypair stays on
+  // mail-delegate state, so bob's keypair stays on
   // the peer and never lands in alice's ADDRESS_BOOK as Entry::Own.
   // Single-gateway-with-two-contexts is unsupported for this
   // verification — alice on gw, bob on peer is the canonical setup.
@@ -1286,7 +1414,7 @@ test.describe("Live node E2E", () => {
       });
       await aliceApp.locator('[data-testid="fm-import-submit"]').click();
 
-      // Wait for the import to commit to the local node + identity-management
+      // Wait for the import to commit to the local node + mail
       // delegate before reloading — otherwise the reload races the in-flight
       // CreateContact and the rehydrated address book lacks bob, so the
       // post-reload compose can't resolve bob's fingerprint.
@@ -1813,6 +1941,15 @@ test.describe("Live node E2E", () => {
 
       // ── Pre-reload: message is in Sent, Drafts is empty ───────────
       await aliceApp.locator('[data-testid="fm-folder-sent"]').click();
+      // Once (1 in ~86 runs) the view stayed on Inbox after this click, with
+      // the pointer still over Sent and no overlay, navigation or error. Say
+      // so here rather than as a missing Sent card: the console then shows
+      // whether the click reached the app ("folder: clicked Sent") and
+      // whether the inbox view re-mounted ("inbox view: mounted").
+      await expect(
+        aliceApp.locator('[data-testid="fm-folder-sent"]'),
+        "the Sent folder is selected after clicking it",
+      ).toHaveClass(/\bactive\b/, { timeout: 5_000 });
       await expect(
         aliceApp.locator('[data-testid="fm-sent-card"]').first(),
         "sent message appears in Sent before reload",
@@ -1823,6 +1960,13 @@ test.describe("Live node E2E", () => {
       ).toHaveText("");
 
       // ── Reload (the #286 trigger) ─────────────────────────────────
+      // The Sent copy reaches the delegate a few round trips after Send, in
+      // a task a reload ends. A reload before that loses it for a real user
+      // too, so wait for the page to say every write is answered.
+      await expect(
+        aliceApp.locator("html"),
+        "the page says no write is still in flight",
+      ).toHaveAttribute("data-pending-saves", "0", { timeout: 30_000 });
       await alicePage.reload();
       const aliceAfter = alicePage.frameLocator("iframe#app");
       await expect(
@@ -2169,6 +2313,346 @@ test.describe("Live node E2E", () => {
       }
     },
   );
+
+  test("two tabs changing different settings keep both (compare-and-swap merge)", async ({
+    browser,
+  }) => {
+    // Settings live in the mail delegate on the node, shared by every tab.
+    // Each tab writes only the fields it changed, over compare-and-swap, so
+    // a tab holding an older copy must not undo another tab's change.
+    const stopPump = startPermissionPump();
+    const ctx = await browser.newContext();
+    const run = `${Date.now().toString(36)}${test.info().repeatEachIndex}`;
+    const alias = `settab${run}`;
+    const openSettingsScreen = async (
+      page: import("@playwright/test").Page,
+      screen: string,
+    ) => {
+      const app = page.frameLocator("iframe#app");
+      await expect(app.locator(".brand-name").first()).toContainText(APP_NAME, {
+        timeout: 60_000,
+      });
+      await app
+        .locator(
+          `[data-testid="fm-id-row"][data-alias="${alias}"] [data-testid="fm-id-open"]`,
+        )
+        .first()
+        .click();
+      await app.locator('[data-testid="fm-settings-btn"]').click();
+      await app
+        .locator(`[data-testid="fm-settings-nav-item"][data-screen="${screen}"]`)
+        .click();
+      return app;
+    };
+    try {
+      const tabA = await ctx.newPage();
+      await tabA.goto("");
+      await createIdentity(tabA, alias);
+      // Tab B loads now, so its copy of the settings predates tab A's change.
+      const tabB = await ctx.newPage();
+      await tabB.goto("");
+      const appB = await openSettingsScreen(tabB, "appearance");
+      const appA = await openSettingsScreen(tabA, "inbox");
+
+      await appA.locator('[data-testid="fm-thread-view-select"]').selectOption("compact");
+      await appB
+        .locator(".fm-row-set", { hasText: "Color theme" })
+        .locator("select")
+        .selectOption("dark");
+
+      // A fresh tab must see both changes. A write that replaced the whole
+      // record would leave one of them missing for good.
+      const tabC = await ctx.newPage();
+      await expect
+        .poll(
+          async () => {
+            await tabC.goto("");
+            const inbox = await openSettingsScreen(tabC, "inbox");
+            // The stored settings load just after the identities appear, so
+            // give each value time to settle before reading it.
+            const viewSelect = inbox.locator('[data-testid="fm-thread-view-select"]');
+            await expect(viewSelect).toHaveValue("compact", { timeout: 15_000 }).catch(() => {});
+            const view = await viewSelect.inputValue();
+            await inbox
+              .locator('[data-testid="fm-settings-nav-item"][data-screen="appearance"]')
+              .click();
+            const themeSelect = inbox
+              .locator(".fm-row-set", { hasText: "Color theme" })
+              .locator("select");
+            await expect(themeSelect).toHaveValue("dark", { timeout: 15_000 }).catch(() => {});
+            const theme = await themeSelect.inputValue();
+            return `${view}/${theme}`;
+          },
+          { timeout: 90_000, intervals: [1_000] },
+        )
+        .toBe("compact/dark");
+    } finally {
+      await ctx.close().catch(() => {});
+      stopPump();
+    }
+  });
+
+  test("a renamed identity's draft and settings persist across reload", async ({
+    browser,
+  }) => {
+    // Local state is stored under the identity's address, not its alias.
+    // Writes made under the NEW alias after a rename must reach the same
+    // identity's items and come back after a reload (a lookup by the old
+    // alias failed every such write with "no identity").
+    const stopPump = startPermissionPump();
+    const ctx = await browser.newContext();
+    const run = `${Date.now().toString(36)}${test.info().repeatEachIndex}`;
+    const before = `rnold${run}`;
+    const after = `rnnew${run}`;
+    const subject = `renamed draft ${run}`;
+    try {
+      const page = await ctx.newPage();
+      await page.goto("");
+      await createIdentity(page, before);
+      const app = page.frameLocator("iframe#app");
+
+      // Rename.
+      await app
+        .locator(`[data-testid="fm-id-row"][data-alias="${before}"] [data-testid="fm-id-rename"]`)
+        .click();
+      await app.locator('[data-testid="fm-rename-input"]').fill(after);
+      await app.locator('[data-testid="fm-rename-submit"]').click();
+      await expect(
+        app.locator(`[data-testid="fm-id-row"][data-alias="${after}"]`),
+        "the row shows the new alias",
+      ).toBeVisible({ timeout: 30_000 });
+
+      // Under the new alias: save a draft, and change a setting.
+      await app
+        .locator(`[data-testid="fm-id-row"][data-alias="${after}"] [data-testid="fm-id-open"]`)
+        .first()
+        .click();
+      await app.locator('[data-testid="fm-compose-btn"]').click();
+      const sheet = app.locator('[data-testid="fm-compose-sheet"]');
+      await sheet.locator('input[placeholder="alias or address"]').fill(after);
+      await sheet.locator('input[placeholder="subject"]').fill(subject);
+      await sheet.locator("textarea.sheet-textarea").fill("written after the rename");
+      // Wait until the delegate has acknowledged the debounced autosave of
+      // what is on screen before closing.
+      await expect(sheet, "the draft is stored").toHaveAttribute("data-autosave", "saved", {
+        timeout: 30_000,
+      });
+      await sheet.locator(".sheet-x").click();
+      await expect(sheet).toHaveCount(0);
+      await app.locator('[data-testid="fm-settings-btn"]').click();
+      await app
+        .locator('[data-testid="fm-settings-nav-item"][data-screen="inbox"]')
+        .click();
+      await app.locator('[data-testid="fm-thread-view-select"]').selectOption("compact");
+
+      // After a reload both are still there, under the renamed identity.
+      await expect
+        .poll(
+          async () => {
+            await page.reload();
+            const fresh = page.frameLocator("iframe#app");
+            await expect(fresh.locator(".brand-name").first()).toContainText(APP_NAME, {
+              timeout: 60_000,
+            });
+            await fresh
+              .locator(`[data-testid="fm-id-row"][data-alias="${after}"] [data-testid="fm-id-open"]`)
+              .first()
+              .click();
+            // Local state loads just after the identities appear.
+            await fresh.locator('[data-testid="fm-folder-drafts"]').click();
+            const card = fresh.locator('[data-testid="fm-draft-card"]', { hasText: subject });
+            await expect(card).toBeVisible({ timeout: 15_000 }).catch(() => {});
+            const draft = (await card.count()) > 0 ? "draft" : "no-draft";
+            await fresh.locator('[data-testid="fm-settings-btn"]').click();
+            await fresh
+              .locator('[data-testid="fm-settings-nav-item"][data-screen="inbox"]')
+              .click();
+            const viewSelect = fresh.locator('[data-testid="fm-thread-view-select"]');
+            await expect(viewSelect).toHaveValue("compact", { timeout: 15_000 }).catch(() => {});
+            return `${draft}/${await viewSelect.inputValue()}`;
+          },
+          { timeout: 120_000, intervals: [2_000] },
+        )
+        .toBe("draft/compact");
+    } finally {
+      await ctx.close().catch(() => {});
+      stopPump();
+    }
+  });
+
+  test("a draft edited just before the compose sheet closes is saved", async ({ browser }) => {
+    // The autosave is debounced (500 ms) and ran in a task owned by the
+    // compose sheet: closing the sheet within the debounce cancelled it,
+    // so the last edit lived only in the page and was gone on reload.
+    const stopPump = startPermissionPump();
+    const ctx = await browser.newContext();
+    const run = `${Date.now().toString(36)}${test.info().repeatEachIndex}`;
+    const alias = `fl${run}`;
+    const subject = `closed fast ${run}`;
+    try {
+      const page = await ctx.newPage();
+      await page.goto("");
+      await createIdentity(page, alias);
+      const app = page.frameLocator("iframe#app");
+      await app
+        .locator(`[data-testid="fm-id-row"][data-alias="${alias}"] [data-testid="fm-id-open"]`)
+        .first()
+        .click();
+      await app.locator('[data-testid="fm-compose-btn"]').click();
+      const sheet = app.locator('[data-testid="fm-compose-sheet"]');
+      await sheet.locator('input[placeholder="alias or address"]').fill(alias);
+      await sheet.locator("textarea.sheet-textarea").fill("first words");
+      await expect(sheet, "the first edit is stored").toHaveAttribute("data-autosave", "saved", {
+        timeout: 30_000,
+      });
+      // The last edit, then close at once: well inside the debounce.
+      await sheet.locator('input[placeholder="subject"]').fill(subject);
+      await sheet.locator(".sheet-x").click();
+      await expect(sheet).toHaveCount(0);
+      // The close hands the edit to a task that outlives the sheet; a reload
+      // before the node answers it would end that task with the page. Wait
+      // for the page to say every save is answered, never for a fixed time.
+      await expect(
+        app.locator("html"),
+        "the page says no save is still in flight",
+      ).toHaveAttribute("data-pending-saves", "0", { timeout: 30_000 });
+
+      await expect
+        .poll(
+          async () => {
+            await page.reload();
+            const fresh = page.frameLocator("iframe#app");
+            await expect(fresh.locator(".brand-name").first()).toContainText(APP_NAME, {
+              timeout: 60_000,
+            });
+            await fresh
+              .locator(`[data-testid="fm-id-row"][data-alias="${alias}"] [data-testid="fm-id-open"]`)
+              .first()
+              .click();
+            await fresh.locator('[data-testid="fm-folder-drafts"]').click();
+            const card = fresh.locator('[data-testid="fm-draft-card"]', { hasText: subject });
+            await expect(card).toBeVisible({ timeout: 15_000 }).catch(() => {});
+            return (await card.count()) > 0 ? "saved" : "lost";
+          },
+          { timeout: 120_000, intervals: [2_000] },
+        )
+        .toBe("saved");
+    } finally {
+      await ctx.close().catch(() => {});
+      stopPump();
+    }
+  });
+
+  test("an identity left at the reveal step gets its contracts on the next load", async ({
+    browser,
+  }) => {
+    // Creating an identity stores it in the mail delegate at once; its
+    // inbox and token-record contracts are published only when the user
+    // presses Continue on the reveal step. If the tab is reloaded before
+    // that, the next load lists the identity and GETs both contracts, the
+    // node answers NotFound (nobody holds them), and the #288 self-heal
+    // re-PUTs them. Without that, the identity would be listed but could
+    // neither receive nor send.
+    const stopPump = startPermissionPump();
+    const ctx = await browser.newContext();
+    const run = `${Date.now().toString(36)}${test.info().repeatEachIndex}`;
+    const alias = `reveal${run}`;
+    try {
+      const page = await ctx.newPage();
+      const lines: string[] = [];
+      page.on("console", (msg) => lines.push(msg.text()));
+      await page.goto("");
+      const app = page.frameLocator("iframe#app");
+      await expect(app.locator(".brand-name").first()).toContainText(APP_NAME, {
+        timeout: 60_000,
+      });
+      await app.locator('[data-testid="fm-id-create"]').click();
+      await app.locator('[data-testid="fm-create-alias-input"]').fill(alias);
+      await app.locator('[data-testid="fm-create-submit"]').click();
+      // The reveal step: the delegate holds the identity now.
+      await expect(app.locator('[data-testid="fm-create-confirm"]')).toBeVisible({
+        timeout: 30_000,
+      });
+
+      // Leave without pressing Continue.
+      await page.reload();
+      const reloaded = page.frameLocator("iframe#app");
+      await expect(
+        reloaded.locator(`[data-testid="fm-id-row"][data-alias="${alias}"]`),
+        "the created identity is listed after the reload",
+      ).toBeVisible({ timeout: 60_000 });
+
+      const healed = (what: string) =>
+        lines.some(
+          (t) =>
+            t.includes(`own ${what} not found on the network`) &&
+            t.includes(`alias=\`${alias}\``) &&
+            t.includes("self-heal"),
+        );
+      await expect
+        .poll(() => healed("inbox") && healed("AFT record"), {
+          message: "both contracts were re-published on the next load",
+          timeout: 180_000,
+          intervals: [2_000],
+        })
+        .toBe(true);
+      // The lines above are logged as each re-PUT is SENT. Reloading before
+      // the node has stored them cancels them, and the next load then (rightly)
+      // self-heals again, so wait for the node to acknowledge both PUTs.
+      const stored = (what: string) =>
+        lines.some(
+          (t) =>
+            t.includes(`own ${what} re-published`) &&
+            t.includes(`alias=\`${alias}\``) &&
+            t.includes("self-heal stored"),
+        );
+      await expect
+        .poll(() => stored("inbox") && stored("AFT record"), {
+          message: "the node acknowledged both self-heal PUTs",
+          timeout: 120_000,
+          intervals: [1_000],
+        })
+        .toBe(true);
+      // And they are held now: a further load FINDS the inbox (a positive
+      // signal, not the mere absence of a self-heal line). Later lines are
+      // read from `mark` on, so nothing logged before is discarded.
+      const mark = lines.length;
+      const since = () => lines.slice(mark);
+      await page.reload();
+      await expect(
+        page
+          .frameLocator("iframe#app")
+          .locator(`[data-testid="fm-id-row"][data-alias="${alias}"]`),
+      ).toBeVisible({ timeout: 60_000 });
+      // Both contracts are found (a positive signal for each), so the check
+      // below runs after both answers, not before a late one.
+      const loaded = (line: string) =>
+        since().some((t) => t.includes(line) && t.includes(`alias=\`${alias}\``));
+      await expect
+        .poll(() => loaded("own inbox state loaded") && loaded("own AFT record loaded"), {
+          message: "the next load found the self-healed inbox and AFT record on the node",
+          timeout: 120_000,
+          intervals: [2_000],
+        })
+        .toBe(true);
+      expect(
+        since().some(
+          (t) =>
+            t.includes("not found on the network") &&
+            t.includes(`alias=\`${alias}\``) &&
+            t.includes("self-heal"),
+        ),
+        "after the self-heal the contracts are found, not re-published again",
+      ).toBe(false);
+      // Checked last, over every line of the test: a self-heal PUT that
+      // failed after the first poll passed still shows up here.
+      const failed = lines.filter((t) => t.includes("re-PUT failed") && t.includes(alias));
+      expect(failed, `no self-heal PUT failed: ${failed.join(" | ")}`).toEqual([]);
+    } finally {
+      await ctx.close().catch(() => {});
+      stopPump();
+    }
+  });
 });
 
 async function composeAndSend(
@@ -2338,6 +2822,35 @@ function coreRelayBugDetected(): boolean {
   const sig =
     /relay_update_broadcast_error|relay_update_streaming_broadcast_error|missing contract parameters|failed to claim (?:stream from )?orphan/;
   return grepLog(sig) || grepPeerLog(sig);
+}
+
+/**
+ * True if one line of a gateway log file contains every needle
+ * (case-insensitive). Reads whole files, unlike `grepLogDir`'s tail
+ * window, so it finds lines written early in the run.
+ */
+function logHasLineWith(dir: string, needles: string[]): boolean {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+  const want = needles.map((n) => n.toLowerCase());
+  for (const ent of entries) {
+    if (!ent.isFile() || !ent.name.startsWith("freenet.")) continue;
+    let text: string;
+    try {
+      text = fs.readFileSync(path.join(dir, ent.name), "utf8");
+    } catch {
+      continue;
+    }
+    for (const line of text.split("\n")) {
+      const l = line.toLowerCase();
+      if (want.every((n) => l.includes(n))) return true;
+    }
+  }
+  return false;
 }
 
 function grepLogDir(dir: string, re: RegExp): boolean {

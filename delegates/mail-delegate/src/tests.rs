@@ -1,5 +1,7 @@
 //! Behaviour through the delegate's entry point, over an in-memory host.
 
+mod faults;
+mod recovery;
 mod resilience;
 mod round2;
 mod round3;
@@ -80,7 +82,21 @@ fn create(env: &mut MemEnv, origin: u8, alias: &str) -> IdentityInfo {
             ui_entropy: Entropy([alias.len() as u8 + 1; 32]),
         },
     ) {
-        Ok(Reply::Identity(i)) => i,
+        Ok(Reply::CreatedIdentity {
+            identity,
+            recovery_key,
+        }) => {
+            // The key returned on creation is this identity's own: both
+            // halves (the address depends on the signing half only).
+            let (dsa, kem) = recovery_key::decode(&recovery_key).unwrap();
+            let keys = crate::crypto::Keys::from_seeds(&dsa, &kem);
+            assert_eq!(
+                freenet_mail_protocol::address::address_of(&keys.vk_bytes()),
+                identity.addr
+            );
+            assert_eq!(keys.ek_bytes(), identity.ek.to_vec());
+            identity
+        }
         other => panic!("{other:?}"),
     }
 }
@@ -302,6 +318,10 @@ fn a_foreign_origin_can_neither_read_nor_change_another_namespace() {
                 Ok(Reply::Item(Some(i))) => assert_eq!(i.body.as_ref(), b"x", "{op:?}"),
                 Ok(Reply::Item(None) | Reply::Deleted | Reply::Ack { .. } | Reply::Identity(_)) => {
                 }
+                // The caller's own new identity, in its own namespace.
+                Ok(Reply::CreatedIdentity { identity, .. }) => {
+                    assert_eq!(identity.alias, "x", "{op:?}")
+                }
                 Ok(other) => panic!("{op:?} leaked {other:?}"),
             }
         }
@@ -319,14 +339,15 @@ fn another_app_exhausting_its_budget_and_the_host_registry_does_not_touch_mail()
         env.secrets
             .insert(format!("o/foreign/{i}").into_bytes(), vec![0; 8]);
     }
-    // The other app has used its whole budget.
+    // The other app has used its whole budget (as a finished recount found
+    // it, so it is not recounted away).
     {
         let mut other = Space::new(&mut env, Origin([OTHER; 32]));
         other.put("filler", b"x").unwrap();
-        let usage_key = other.full_key("mt/usage");
-        let mut full = store::MAX_ORIGIN_KEYS.to_le_bytes().to_vec();
-        full.extend_from_slice(&0u64.to_le_bytes());
-        env.secrets.insert(usage_key, full);
+        other.confirm_usage_for_test(store::Usage {
+            keys: store::MAX_ORIGIN_KEYS,
+            bytes: 0,
+        });
     }
     assert_eq!(
         call(
@@ -593,6 +614,50 @@ fn status_reports_only_the_callers_namespace() {
 }
 
 // ── Identities ──────────────────────────────────────────────────────────────
+
+#[test]
+fn the_recovery_key_comes_back_on_creation_only() {
+    let mut env = MemEnv::default();
+    let me = create(&mut env, PROD, "alice");
+    // Re-creating under the same alias is refused: no second key.
+    assert_eq!(
+        call(
+            &mut env,
+            PROD,
+            Op::CreateIdentity {
+                alias: "alice".into(),
+                description: String::new(),
+                ui_entropy: Entropy([7; 32]),
+            }
+        ),
+        Err(FailureCode::Conflict { current_gen: 0 })
+    );
+    // Importing an identity answers with its public view only, fresh or not.
+    let (dsa, kem) = fixture_seeds();
+    for _ in 0..2 {
+        match call(
+            &mut env,
+            PROD,
+            Op::ImportIdentity {
+                source: ImportSource::Seeds {
+                    dsa: dsa.clone(),
+                    kem: kem.clone(),
+                },
+                kind: ImportKind::UserRestore,
+                alias: "bob".into(),
+                description: String::new(),
+            },
+        ) {
+            Ok(Reply::Imported { .. }) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    // Listing never carries a key either.
+    match call(&mut env, PROD, Op::ListIdentities) {
+        Ok(Reply::Identities(ids)) => assert!(ids.iter().any(|i| i.addr == me.addr)),
+        other => panic!("{other:?}"),
+    }
+}
 
 #[test]
 fn identities_are_created_without_exposing_seeds() {
@@ -1202,6 +1267,30 @@ fn import_fixture(env: &mut MemEnv, origin: u8) -> Addr {
     .unwrap()
     .0
     .addr
+}
+
+/// The node answers a prompt nobody answered (its 60 s timeout, or a
+/// dismissed dialog) with an EMPTY response. That must end the waiting
+/// request with a refusal, which is what keeps the UI from waiting out its
+/// own much longer backstop, and the refusal must say it went unanswered.
+#[test]
+fn an_unanswered_prompt_ends_the_waiting_request() {
+    let mut env = MemEnv::default();
+    let addr = import_fixture(&mut env, PROD);
+    let id = prompt(&send(&mut env, app(PROD), Op::ExportRecoveryKey { addr })).0;
+    let failure = response(&answer(&mut env, PROD, id, b""))
+        .result
+        .unwrap_err();
+    assert_eq!(failure.code, FailureCode::Refused);
+    assert!(
+        failure.detail.contains("not answered"),
+        "{}",
+        failure.detail
+    );
+    assert!(
+        answer(&mut env, PROD, id, ALLOW).is_empty(),
+        "the prompt is gone"
+    );
 }
 
 #[test]

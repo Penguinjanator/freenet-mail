@@ -32,6 +32,15 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# Release freeze, before anything else: while `.release-freeze` exists a
+# release would ship an incomplete migration (see the file's text).
+"$REPO_ROOT/scripts/check-release-freeze.sh"
+# `--check-freeze` stops here, so the freeze test never runs a release.
+if [ "${1:-}" = "--check-freeze" ]; then
+    echo "release freeze check passed"
+    exit 0
+fi
+
 # ─── Argument parsing ──────────────────────────────────────────────────────
 
 VERSION="${1:-}"

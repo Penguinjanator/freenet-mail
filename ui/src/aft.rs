@@ -74,16 +74,79 @@ thread_local! {
     /// A token which has been confirmed as valid by a contract update.
     static VALID_TOKEN: RefCell<HashMap<AftDelegate, Vec<TokenAssignment>>> = RefCell::new(HashMap::new());
     static PENDING_INBOXES_UPDATES: RefCell<Vec<(InboxContract, AssignmentHash)>> = const { RefCell::new(Vec::new()) };
-    /// Recipient fingerprints (six-word, dash-joined) for pending sends.
-    ///
-    /// Populated by `assign_token` from the recipient's ML-DSA VK bytes.
-    /// Cleared when the token assignment is either confirmed or drained.
-    /// Used by the permission pump to resolve which recipients are pending so
-    /// it can look up per-recipient saved decisions (#149 Part 2).
-    /// Pending recipient ML-DSA VK bytes for sends awaiting token assignment.
-    /// Stored as raw byte vecs so the permission pump can cross-reference
-    /// against the address book without a hex-decode step.
-    static PENDING_RECIPIENT_VK_BYTES: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+}
+
+thread_local! {
+    /// When each token-generator call still waiting for its answer was
+    /// sent (ms since the epoch), oldest first.
+    static TOKEN_CALLS: RefCell<std::collections::VecDeque<i64>> =
+        const { RefCell::new(std::collections::VecDeque::new()) };
+    /// Calls taken out of `TOKEN_CALLS` as expired, still unanswered. The
+    /// node answers token calls in the order they were sent, so the next
+    /// answer belongs to the oldest of these, not to a newer call.
+    static TOKEN_CALLS_EXPIRED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// A token call unanswered for longer than this no longer counts as in
+/// flight: an answer the node never sent must not misattribute errors for
+/// the rest of the page.
+const TOKEN_CALL_WINDOW_MS: i64 = 60_000;
+
+/// A token-generator call was sent.
+pub(crate) fn note_token_call_sent() {
+    note_token_call_sent_at(chrono::Utc::now().timestamp_millis());
+}
+
+fn note_token_call_sent_at(now_ms: i64) {
+    TOKEN_CALLS.with(|c| c.borrow_mut().push_back(now_ms));
+}
+
+/// A token-generator call was answered (or an error was taken as its
+/// answer).
+pub(crate) fn note_token_call_answered() {
+    note_token_call_answered_at(chrono::Utc::now().timestamp_millis());
+}
+
+fn note_token_call_answered_at(now_ms: i64) {
+    expire_token_calls(now_ms);
+    // Answers come in send order: a late answer to a call that already
+    // expired must not end a newer call's window.
+    let late = TOKEN_CALLS_EXPIRED.with(|e| {
+        let n = e.get();
+        if n > 0 {
+            e.set(n - 1);
+        }
+        n > 0
+    });
+    if !late {
+        TOKEN_CALLS.with(|c| c.borrow_mut().pop_front());
+    }
+}
+
+fn expire_token_calls(now_ms: i64) {
+    TOKEN_CALLS.with(|c| {
+        let mut c = c.borrow_mut();
+        while c
+            .front()
+            .is_some_and(|sent| now_ms - sent > TOKEN_CALL_WINDOW_MS)
+        {
+            c.pop_front();
+            TOKEN_CALLS_EXPIRED.with(|e| e.set(e.get().saturating_add(1)));
+        }
+    });
+}
+
+/// Whether a token-generator call is waiting for its answer: a node
+/// delegate error naming no delegate is then that call's, not the mail
+/// delegate's. Counts actual calls, not "a token record is unconfirmed",
+/// which lasts long after the call was answered.
+pub(crate) fn token_request_in_flight() -> bool {
+    token_calls_in_flight_at(chrono::Utc::now().timestamp_millis())
+}
+
+fn token_calls_in_flight_at(now_ms: i64) -> bool {
+    expire_token_calls(now_ms);
+    TOKEN_CALLS.with(|c| !c.borrow().is_empty())
 }
 
 /// Default timeout for pending AFT confirmations. If the host's
@@ -147,8 +210,7 @@ impl AftRecords {
     /// authoritative source of truth for "is this my own AFT record" —
     /// independent of any routing-map population order.
     pub fn record_key_for(identity: &Identity) -> Result<AftRecord, DynError> {
-        use ml_dsa::signature::Keypair;
-        Self::record_key_for_vk(&identity.ml_dsa_signing_key.as_ref().verifying_key())
+        Self::record_key_for_vk(&identity.ml_dsa_vk())
     }
 
     pub(crate) fn record_key_for_vk(
@@ -283,38 +345,6 @@ impl AftRecords {
         })
     }
 
-    /// Register the recipient VK bytes for a pending send so the permission
-    /// pump can look it up when deciding whether to auto-accept.
-    /// `recipient_vk_bytes` must be the raw ML-DSA-65 verifying key bytes
-    /// used to derive the inbox `InboxParams.pub_key`.
-    pub fn register_pending_recipient(recipient_vk_bytes: &[u8]) {
-        PENDING_RECIPIENT_VK_BYTES.with(|vec| {
-            let mut v = vec.borrow_mut();
-            if !v.iter().any(|b| b.as_slice() == recipient_vk_bytes) {
-                v.push(recipient_vk_bytes.to_vec());
-            }
-        });
-    }
-
-    /// Snapshot and return the pending recipient VK bytes list, then clear
-    /// it. Called by the permission pump after applying a response.
-    #[cfg(all(target_family = "wasm", feature = "use-node"))]
-    pub fn drain_pending_recipient_vk_bytes() -> Vec<Vec<u8>> {
-        PENDING_RECIPIENT_VK_BYTES.with(|vec| {
-            let mut v = vec.borrow_mut();
-            let out = v.clone();
-            v.clear();
-            out
-        })
-    }
-
-    /// Non-destructive snapshot of pending recipient VK bytes. Called by
-    /// the permission pump when evaluating policy without consuming state.
-    #[cfg(all(target_family = "wasm", feature = "use-node"))]
-    pub fn peek_pending_recipient_vk_bytes() -> Vec<Vec<u8>> {
-        PENDING_RECIPIENT_VK_BYTES.with(|vec| vec.borrow().clone())
-    }
-
     pub async fn confirm_allocation(
         client: &mut WebApiRequestClient,
         aft_record: AftRecordId,
@@ -439,39 +469,40 @@ impl AftRecords {
         generator_id: &Identity,
         assignment_hash: [u8; 32],
     ) -> Result<DelegateKey, DynError> {
-        use ml_dsa::signature::Keypair;
-
         static REQUEST_ID: AtomicU32 = AtomicU32::new(0);
 
-        // AFT token signing now reuses the identity's ML-DSA-65 key. The
-        // delegate stores the 32-byte seed; the generator-identity in
-        // TokenAssignment is the encoded verifying key bytes.
-        let sender_vk = generator_id.ml_dsa_signing_key.as_ref().verifying_key();
-        let seed_bytes = {
-            let s = generator_id.ml_dsa_signing_key.as_ref().to_seed();
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(s.as_slice());
-            arr
-        };
-        let token_params: Parameters = DelegateParameters::new(seed_bytes)
+        // AFT token signing reuses the identity's ML-DSA-65 key. The v1
+        // token-generator delegate's parameters carry its seed, so the mail
+        // delegate hands them out for this transitional path only
+        // (`V1AftParams`, removed with the anti-flood tokens); the
+        // generator-identity in TokenAssignment is the encoded verifying key.
+        // The decoded `DelegateParameters`/`Parameters` below are plain
+        // copies of the seed held across the awaits that follow; they are
+        // freed, not zeroized (see `ops::v1_aft_params`).
+        let sender_vk = generator_id.ml_dsa_vk();
+        let params_json = crate::mail_delegate::ops::v1_aft_params(generator_id.addr)
+            .await
+            .map_err(|e| format!("could not get the token generator parameters: {e}"))?;
+        let delegate_params: DelegateParameters = serde_json::from_slice(&params_json)?;
+        let token_params: Parameters = serde_json::from_slice::<DelegateParameters>(&params_json)?
             .try_into()
-            .map_err(|e| format!("{e}"))
-            .unwrap();
+            .map_err(|e| format!("{e}"))?;
+        drop(params_json);
         let delegate_key = DelegateKey::from_params(
             crate::aft::TOKEN_GENERATOR_DELEGATE_CODE_HASH,
             &token_params,
         )?;
+        // Registered here, at first use, rather than for every identity on
+        // load (the parameters carry the identity's signing seed).
+        #[cfg(feature = "use-node")]
+        crate::api::ensure_token_generator_registered(client, &token_params).await?;
 
-        // Keep a copy for the recipient-tracking registration below before
-        // the vec is consumed by `InboxParams`.
-        let recipient_vk_for_tracking = recipient_inbox_pub_key.clone();
         let inbox_params: Parameters = InboxParams {
             pub_key: recipient_inbox_pub_key,
         }
         .try_into()?;
         let inbox_code_hash = recipient_inbox_wasm_hash.unwrap_or(crate::inbox::INBOX_CODE_HASH);
         let inbox_key = ContractKey::from_params(inbox_code_hash, inbox_params.clone())?;
-        let delegate_params = DelegateParameters::new(seed_bytes);
 
         let record_params = TokenDelegateParameters::new(&sender_vk);
         let token_record: ContractInstanceId = ContractKey::from_params(
@@ -549,11 +580,11 @@ impl AftRecords {
         PENDING_INBOXES_UPDATES.with(|queue| {
             queue.borrow_mut().push((inbox_key, assignment_hash));
         });
-        // Register the recipient's VK hex so the permission pump can
-        // resolve which recipients have pending sends when it needs to
-        // evaluate per-recipient saved decisions (#149 Part 2).
-        Self::register_pending_recipient(&recipient_vk_for_tracking);
-        client.send(request.into()).await?;
+        note_token_call_sent();
+        if let Err(e) = client.send(request.into()).await {
+            note_token_call_answered();
+            return Err(e.into());
+        }
         Ok(delegate_key)
     }
 
@@ -766,6 +797,64 @@ pub(crate) fn format_insufficient_tier_toast(required: Tier) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Only an actual token call waiting for its answer counts as in
+    /// flight, and only for a while (round-8 X9). An unconfirmed token
+    /// record (an entry in PENDING_INBOXES_UPDATES) is not a call: it used
+    /// to keep keyless node errors away from the mail calls for as long as
+    /// the record went unconfirmed.
+    /// The node answers token calls in send order. An answer arriving after
+    /// its call's window ran out belongs to that expired call: it must not
+    /// end a newer call's window, or a keyless error of the newer call would
+    /// be blamed on the mail delegate (round 9).
+    #[test]
+    fn a_late_answer_to_an_expired_token_call_does_not_end_a_newer_one() {
+        TOKEN_CALLS.with(|c| c.borrow_mut().clear());
+        TOKEN_CALLS_EXPIRED.with(|e| e.set(0));
+        let t0 = 1_000_000;
+        note_token_call_sent_at(t0);
+        let t1 = t0 + TOKEN_CALL_WINDOW_MS + 1;
+        assert!(!token_calls_in_flight_at(t1), "the first call expired");
+        note_token_call_sent_at(t1);
+        // The first call's late answer; the second still waits.
+        note_token_call_answered_at(t1 + 10);
+        assert!(token_calls_in_flight_at(t1 + 10));
+        note_token_call_answered_at(t1 + 20);
+        assert!(!token_calls_in_flight_at(t1 + 20));
+    }
+
+    #[test]
+    fn only_a_waiting_token_call_is_in_flight_and_not_for_ever() {
+        let now = 1_000_000;
+        TOKEN_CALLS.with(|c| c.borrow_mut().clear());
+        TOKEN_CALLS_EXPIRED.with(|e| e.set(0));
+        PENDING_INBOXES_UPDATES.with(|q| q.borrow_mut().clear());
+        assert!(!token_calls_in_flight_at(now));
+        PENDING_INBOXES_UPDATES.with(|q| {
+            q.borrow_mut().push((
+                freenet_stdlib::prelude::ContractKey::from_params(
+                    crate::inbox::INBOX_CODE_HASH,
+                    freenet_stdlib::prelude::Parameters::from(vec![1u8; 8]),
+                )
+                .unwrap(),
+                [0; 32],
+            ))
+        });
+        assert!(
+            !token_calls_in_flight_at(now),
+            "an unconfirmed record is no call"
+        );
+        TOKEN_CALLS.with(|c| c.borrow_mut().push_back(now));
+        assert!(token_calls_in_flight_at(now + 30_000));
+        note_token_call_answered();
+        assert!(!token_calls_in_flight_at(now + 30_000));
+        TOKEN_CALLS.with(|c| c.borrow_mut().push_back(now));
+        assert!(
+            !token_calls_in_flight_at(now + TOKEN_CALL_WINDOW_MS + 1),
+            "a lost answer expires"
+        );
+        PENDING_INBOXES_UPDATES.with(|q| q.borrow_mut().clear());
+    }
+
     use super::*;
     use freenet_stdlib::prelude::ContractInstanceId;
 
